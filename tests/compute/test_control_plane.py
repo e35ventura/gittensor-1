@@ -2,7 +2,13 @@ import pytest
 
 from gittensor.compute.config import ComputeConfig
 from gittensor.compute.control_plane import ComputeControlPlane
-from gittensor.compute.models import GPURegistration, Release
+from gittensor.compute.models import (
+    GPURegistration,
+    GPUState,
+    Release,
+    RoutingObservation,
+    RuntimeEvidence,
+)
 from gittensor.compute.routing import CapacityUnavailable
 
 
@@ -178,8 +184,63 @@ def test_assignment_change_requires_new_canary_binding_and_verification():
 
     control.begin_assignment('gpu-1', 'release:2', now=110)
     rejected = control.refresh_verification([_snapshot(1, last_checked=110)], now=110)
-    assert 'canary binding' in rejected['gpu-1']
+    assert rejected == {'gpu-1': 'DRAINING'}
+    assert control.status(now=110)['ready_gpus'] == 0
 
-    control.bind_runtime_canary('gpu-1', 'release:2')
+    control.acknowledge_assignment('gpu-1', 1, GPUState.LOADING, now=110)
+    release = control.releases['release:2']
+    control.acknowledge_assignment(
+        'gpu-1',
+        1,
+        GPUState.RUNTIME_VERIFY,
+        RuntimeEvidence(
+            release_digest=release.release_digest,
+            model_repository=release.model_repository,
+            model_revision=release.model_revision,
+            runtime_digest=release.runtime_digest,
+            runtime_commit=release.runtime_commit,
+            container_image=release.container_image,
+            container_digest=release.container_digest,
+            filesystem_digest=release.filesystem_digest,
+        ),
+        now=110,
+    )
     accepted = control.refresh_verification([_snapshot(1, last_checked=111)], now=111)
     assert accepted == {'gpu-1': 'READY'}
+
+
+def test_gateway_observation_updates_authoritative_routing_telemetry():
+    control = ComputeControlPlane(_config(), clock=Clock(100))
+    control.register_release(Release('release:1', 'model', 'runtime'))
+    control.register_gpu(
+        GPURegistration(
+            gpu_id='gpu-1',
+            spark_node_id='node-1',
+            miner_uid=1,
+            endpoint='https://gpu-1',
+            region='us-east',
+            release_digest='release:1',
+            canary_release_digest='release:1',
+            certified_slots=4,
+        )
+    )
+    control.refresh_verification([_snapshot(1)], now=100)
+
+    control.record_routing_observation(
+        RoutingObservation(
+            gpu_id='gpu-1',
+            requester_region='us-east',
+            measured_rtt_ms=12,
+            service_seconds=2.5,
+            success=True,
+            observed_active_slots=2,
+            remaining_work_seconds=1.25,
+        ),
+        now=101,
+    )
+
+    record = control.gpus['gpu-1']
+    assert record.measured_rtt_by_region_ms == {'us-east': 12}
+    assert record.service_seconds_ewma == 2.5
+    assert record.gateway_active_slots == 2
+    assert record.gateway_remaining_work_seconds == 1.25

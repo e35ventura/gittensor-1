@@ -1,0 +1,20 @@
+name: Compute sub-subnet
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'codex/**'
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install 3.12
+      - run: uv sync --extra dev
+      - name: Lint compute integration
+        run: uv run ruff check gittensor/compute gittensor/validator/compute_rewards.py tests/compute tests/validator/test_compute_rewards.py
+      - name: Test compute integration
+        run: uv run pytest tests/compute tests/validator/test_compute_rewards.py tests/validator/test_blend_emission_pools.py -q

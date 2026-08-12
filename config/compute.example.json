@@ -22,14 +22,46 @@
     "require_model_canary": true,
     "bearer_token_env": null,
     "source_repository": "https://github.com/gittensor-ai-lab/sparkcompute",
-    "source_commit": "aa61fbc20d24c217ea9f33e20be67d75a388e45d"
+    "source_commit": "aa61fbc20d24c217ea9f33e20be67d75a388e45d",
+    "expected_verifier_protocol": "sparkcompute-v1",
+    "expected_verifier_measurement": "sha256:REPLACE_WITH_DEPLOYED_VERIFIER_MEASUREMENT",
+    "require_verifier_measurement": true,
+    "require_runtime_attestation": true,
+    "require_weight_challenges": true,
+    "weight_challenge_interval_seconds": 30,
+    "weight_challenge_ttl_seconds": 30,
+    "weight_verification_ttl_seconds": 900,
+    "challenge_sample_size": 3,
+    "require_signed_containers": true,
+    "cosign_binary": "cosign",
+    "cosign_public_key_path": "config/gittensor-runtime-cosign.pub"
   },
   "router": {
     "reservation_ttl_seconds": 180,
-    "default_rtt_ms": 50
+    "default_rtt_ms": 50,
+    "equivalent_finish_epsilon_seconds": 0.025,
+    "telemetry_ttl_seconds": 30
   },
   "placement": {
     "minimum_residency_seconds": 900,
     "control_interval_seconds": 60
+  },
+  "state": {
+    "database_path": "var/gittensor-compute.sqlite3"
+  },
+  "identity": {
+    "netuid": 74,
+    "network": "finney",
+    "signature_ttl_seconds": 60,
+    "metagraph_refresh_seconds": 60,
+    "spark_node_owners_path": "config/spark-node-owners.json"
+  },
+  "assignment": {
+    "request_timeout_seconds": 15,
+    "bearer_token_env": "GITTENSOR_ASSIGNMENT_TOKEN"
+  },
+  "control_loop": {
+    "verification_interval_seconds": 30,
+    "settlement_interval_seconds": 3600
   }
 }

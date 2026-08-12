@@ -55,6 +55,10 @@ states
 expected_completion_seconds
 effective_ready_gpus
 unspent_budget
+evidence_digest
+_.row_factory
+StaticIdentityResolver
+HMACStreamVerifier
 
 # BaseHTTPRequestHandler discovers these names dynamically.
 _.server_version

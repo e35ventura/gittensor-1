@@ -32,7 +32,7 @@ The result: a sustainable incentive layer that channels resources toward buildin
 
 ## Compute Sub-Subnet
 
-This fork includes a reference RTX 5090 inference control plane. It uses [SparkCompute](https://github.com/gittensor-ai-lab/sparkcompute) for hardware, driver, uptime, liveness, and exact-model verification. Gittensor adds a demand-scaled target-price GPU market, one global Gepetto placement map, atomic fastest-finish routing, and READY-second settlement.
+This fork includes a durable RTX 5090 inference control plane. It uses [SparkCompute](https://github.com/gittensor-ai-lab/sparkcompute) for hardware, driver, uptime, liveness, GPU work, and model canaries. Gittensor adds signed immutable releases, random weight challenges, a demand-scaled target-price GPU market, one executing global Gepetto, fastest-finish routing, and validator-integrated READY-second settlement.
 
 See [the compute sub-subnet design and runbook](docs/compute-subsubnet.md).
 

@@ -9,6 +9,7 @@ import bittensor as bt
 from gittensor.classes import MinerEvaluation, MinerEvaluationCache
 from gittensor.utils.mirror.client import MirrorClient, MirrorRequestError
 from gittensor.utils.uids import get_all_uids
+from gittensor.validator.compute_rewards import load_compute_scores
 from gittensor.validator.emission_allocation import blend_emission_pools
 from gittensor.validator.issue_competitions.forward import issue_competitions
 from gittensor.validator.issue_discovery.scan import run_issue_discovery
@@ -76,7 +77,14 @@ async def forward(self: 'Validator') -> None:
 
         # 5. Allocate repo-bounded emission shares into final rewards
         maintainer_uids_by_repo = build_maintainer_uids_by_repo(miner_evaluations, master_repositories, miner_uids)
-        rewards = blend_emission_pools(miner_evaluations, master_repositories, miner_uids, maintainer_uids_by_repo)
+        compute_scores = load_compute_scores(self.metagraph.hotkeys)
+        rewards = blend_emission_pools(
+            miner_evaluations,
+            master_repositories,
+            miner_uids,
+            maintainer_uids_by_repo,
+            compute_scores,
+        )
 
         self.update_scores(rewards, miner_uids, blacklisted_uids=sorted(penalized_uids))
 

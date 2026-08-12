@@ -18,6 +18,7 @@ wandb
 
 # Validator data directory (contains sensitive miner PATs)
 data/
+var/
 
 CLAUDE.md
 .claude/

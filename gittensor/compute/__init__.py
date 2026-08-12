@@ -1,11 +1,12 @@
 """Global compute sub-subnet control plane.
 
-The package separates four responsibilities:
+The package separates the core responsibilities:
 
-* SparkCompute decides whether a GPU is eligible.
+* SparkCompute and Gittensor release checks decide whether a GPU is eligible.
 * The autoscaler and funding guard decide the paid target.
 * Global Gepetto decides which release each GPU should run.
 * The router atomically reserves the eligible GPU expected to finish first.
+* Durable settlement maps verified GPU-seconds into validator weights.
 """
 
 from gittensor.compute.autoscaler import AutoscaleDecision, FleetAutoscaler
