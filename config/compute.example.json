@@ -1,0 +1,35 @@
+{
+  "fleet": {
+    "floor": 4,
+    "initial_target": 4,
+    "certified_slots_per_gpu": 4,
+    "target_price_per_gpu_hour": 0.65,
+    "max_budget_per_hour": 2.6
+  },
+  "autoscaling": {
+    "ewma_alpha": 0.3,
+    "utilization_up": 0.75,
+    "utilization_down": 0.35,
+    "sustain_up_seconds": 120,
+    "sustain_down_seconds": 900,
+    "cooldown_seconds": 900
+  },
+  "verification": {
+    "status_url": "http://127.0.0.1:9090/api/status",
+    "timeout_seconds": 5,
+    "lease_ttl_seconds": 90,
+    "expected_hardware": "RTX 5090",
+    "require_model_canary": true,
+    "bearer_token_env": null,
+    "source_repository": "https://github.com/gittensor-ai-lab/sparkcompute",
+    "source_commit": "aa61fbc20d24c217ea9f33e20be67d75a388e45d"
+  },
+  "router": {
+    "reservation_ttl_seconds": 180,
+    "default_rtt_ms": 50
+  },
+  "placement": {
+    "minimum_residency_seconds": 900,
+    "control_interval_seconds": 60
+  }
+}

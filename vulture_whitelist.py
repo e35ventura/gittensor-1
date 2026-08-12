@@ -43,3 +43,20 @@ _.get_help  # unused method (gittensor/cli/issue_commands/help.py:125)
 _.ttl_get_block  # unused method (gittensor/utils/misc.py:91)
 _.get_help  # unused method (gittensor/cli/issue_commands/help.py:180)
 add_validator_args  # unused function (gittensor/utils/config.py:81)
+
+# Compute control-plane fields serialized through dataclasses / HTTP JSON.
+ready_gpus
+registered_gpus
+hardware_type
+hardware_uuid
+from_release
+to_release
+states
+expected_completion_seconds
+effective_ready_gpus
+unspent_budget
+
+# BaseHTTPRequestHandler discovers these names dynamically.
+_.server_version
+_.do_GET
+_.do_POST

@@ -30,6 +30,12 @@ Open source powers the modern world, yet most contributors work for free. Gitten
 
 The result: a sustainable incentive layer that channels resources toward building and maintaining the software we all depend on.
 
+## Compute Sub-Subnet
+
+This fork includes a reference RTX 5090 inference control plane. It uses [SparkCompute](https://github.com/gittensor-ai-lab/sparkcompute) for hardware, driver, uptime, liveness, and exact-model verification. Gittensor adds a demand-scaled target-price GPU market, one global Gepetto placement map, atomic fastest-finish routing, and READY-second settlement.
+
+See [the compute sub-subnet design and runbook](docs/compute-subsubnet.md).
+
 ---
 
 ## Miners

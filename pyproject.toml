@@ -30,6 +30,7 @@ debug = [
 
 [project.scripts]
 gitt = "gittensor.cli.main:main"
+gitt-compute = "gittensor.compute.service:main"
 
 [build-system]
 requires = ["hatchling"]
