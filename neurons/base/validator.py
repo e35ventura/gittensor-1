@@ -305,7 +305,13 @@ class BaseValidatorNeuron(BaseNeuron):
         # Update the hotkeys.
         self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
 
-    def update_scores(self, rewards: np.ndarray, uids: set[int], blacklisted_uids: List[int] = None):
+    def update_scores(
+        self,
+        rewards: np.ndarray,
+        uids: set[int],
+        blacklisted_uids: List[int] = None,
+        alpha_override: float | None = None,
+    ):
         """Performs exponential moving average on the scores based on the rewards received from the miners."""
 
         # Check if rewards contains NaN values.
@@ -345,7 +351,9 @@ class BaseValidatorNeuron(BaseNeuron):
 
         # Update scores with rewards produced by this step.
         # shape: [ metagraph.n ]
-        alpha: float = self.config.neuron.moving_average_alpha
+        alpha: float = self.config.neuron.moving_average_alpha if alpha_override is None else alpha_override
+        if not 0 < alpha <= 1:
+            raise ValueError('moving-average alpha must be greater than 0 and at most 1')
         self.scores: np.ndarray = alpha * scattered_rewards + (1 - alpha) * self.scores
         bt.logging.debug(f'Updated moving avg scores: {self.scores}')
 

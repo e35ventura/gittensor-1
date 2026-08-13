@@ -45,7 +45,7 @@ class FleetAutoscaler:
     def update(
         self,
         *,
-        active_slots: int,
+        active_slots: float,
         rejected_concurrent_demand: float,
         funded_target: int,
         now: float,
@@ -57,15 +57,18 @@ class FleetAutoscaler:
         demand = max(0.0, float(active_slots)) + self.rejection_demand_ewma
         capacity = max(1, funded_target * self.certified_slots_per_gpu)
         utilization = demand / capacity
+        desired_capacity = max(1, self.desired_target * self.certified_slots_per_gpu)
+        desired_utilization = demand / desired_capacity
+        threshold_capacity = self.certified_slots_per_gpu * self.config.utilization_up
+        required_target = max(self.floor, math.floor(demand / threshold_capacity) + 1) if demand > 0 else self.floor
         changed = False
         reason = 'inside hysteresis band'
 
-        if utilization >= self.config.utilization_up:
+        if utilization >= self.config.utilization_up and required_target > self.desired_target:
             self.low_since = None
             self.high_since = self.high_since if self.high_since is not None else now
             if now - self.high_since >= self.config.sustain_up_seconds:
-                required = math.ceil(demand / (self.certified_slots_per_gpu * self.config.utilization_up))
-                new_target = max(self.desired_target + 1, required, self.floor)
+                new_target = required_target
                 changed = new_target != self.desired_target
                 self.desired_target = new_target
                 self.last_scaled_at = now
@@ -73,7 +76,7 @@ class FleetAutoscaler:
                 reason = 'sustained high utilization'
             else:
                 reason = 'high utilization is not yet sustained'
-        elif utilization <= self.config.utilization_down:
+        elif desired_utilization <= self.config.utilization_down:
             self.high_since = None
             self.low_since = self.low_since if self.low_since is not None else now
             cooldown_ready = self.last_scaled_at is None or now - self.last_scaled_at >= self.config.cooldown_seconds
@@ -89,6 +92,10 @@ class FleetAutoscaler:
                 reason = 'low utilization is inside scale-down cooldown'
             else:
                 reason = 'low utilization is not yet sustained'
+        elif utilization >= self.config.utilization_up:
+            self.high_since = None
+            self.low_since = None
+            reason = 'desired target already covers measured demand; funding is constrained'
         else:
             self.high_since = None
             self.low_since = None

@@ -155,6 +155,7 @@ OSS_EMISSION_SHARE = 0.90
 # When compute settlement is configured, this slice is carved from OSS_EMISSION_SHARE.
 # Without a configured settlement source, existing subnet economics stay unchanged.
 COMPUTE_EMISSION_SHARE = 0.10
+MAX_COMPUTE_EMISSION_SHARE = 0.50
 DEFAULT_ISSUE_DISCOVERY_SHARE = 0.5
 EMISSION_SHARE_TOLERANCE = 1e-9
 MAX_MAINTAINER_CUT = 0.5  # maintaining is only half of the problem to software, at maximum

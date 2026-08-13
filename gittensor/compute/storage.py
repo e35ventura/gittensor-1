@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -51,26 +52,60 @@ class SQLiteStateStore:
                     created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS settlements_ended_at ON settlements(ended_at DESC);
+                CREATE TABLE IF NOT EXISTS reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    gpu_id TEXT NOT NULL,
+                    release_digest TEXT NOT NULL,
+                    service_seconds REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS reservations_expires_at ON reservations(expires_at);
                 """
             )
+        os.chmod(self.path, 0o600)
 
     def load_state(self) -> dict[str, Any] | None:
         with self._lock, self._connect() as connection:
             row = connection.execute("SELECT value FROM state WHERE key = 'control_plane'").fetchone()
         return json.loads(row['value']) if row else None
 
-    def save_state(self, state: Mapping[str, Any]) -> None:
+    def save_state_and_delete_gpu_reservations(
+        self,
+        state: Mapping[str, Any],
+        gpu_ids: tuple[str, ...] | list[str] | set[str],
+        reservation_ids: tuple[str, ...] | list[str] | set[str] = (),
+    ) -> None:
+        """Commit security state and its reservation invalidations together."""
         value = json.dumps(state, sort_keys=True, separators=(',', ':'))
         now = time.time()
         with self._lock, self._connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            connection.execute(
-                """
-                INSERT INTO state(key, value, updated_at) VALUES('control_plane', ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-                """,
-                (value, now),
-            )
+            try:
+                normalized_gpu_ids = tuple(sorted(set(gpu_ids)))
+                if normalized_gpu_ids:
+                    placeholders = ','.join('?' for _ in normalized_gpu_ids)
+                    connection.execute(
+                        f'DELETE FROM reservations WHERE gpu_id IN ({placeholders})',
+                        normalized_gpu_ids,
+                    )
+                normalized_reservation_ids = tuple(sorted(set(reservation_ids)))
+                if normalized_reservation_ids:
+                    placeholders = ','.join('?' for _ in normalized_reservation_ids)
+                    connection.execute(
+                        f'DELETE FROM reservations WHERE reservation_id IN ({placeholders})',
+                        normalized_reservation_ids,
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO state(key, value, updated_at) VALUES('control_plane', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (value, now),
+                )
+            except Exception:
+                connection.execute('ROLLBACK')
+                raise
             connection.execute('COMMIT')
 
     def consume_nonce(self, hotkey: str, nonce: str, expires_at: float) -> bool:
@@ -89,15 +124,110 @@ class SQLiteStateStore:
             connection.execute('COMMIT')
         return True
 
-    def record_settlement(
+    def create_reservation(
+        self,
+        reservation_id: str,
+        gpu_id: str,
+        release_digest: str,
+        service_seconds: float,
+        created_at: float,
+        expires_at: float,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO reservations(
+                    reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at),
+            )
+
+    def complete_reservation(self, reservation_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute('DELETE FROM reservations WHERE reservation_id = ?', (reservation_id,))
+        return cursor.rowcount > 0
+
+    def save_state_and_complete_reservation(
+        self,
+        state: Mapping[str, Any],
+        reservation_id: str,
+        gpu_ids: tuple[str, ...] | list[str] | set[str] = (),
+        expired_reservation_ids: tuple[str, ...] | list[str] | set[str] = (),
+    ) -> bool:
+        """Atomically consume one reservation and checkpoint its utilization accounting."""
+        value = json.dumps(state, sort_keys=True, separators=(',', ':'))
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                normalized_gpu_ids = tuple(sorted(set(gpu_ids)))
+                if normalized_gpu_ids:
+                    placeholders = ','.join('?' for _ in normalized_gpu_ids)
+                    connection.execute(
+                        f'DELETE FROM reservations WHERE gpu_id IN ({placeholders})',
+                        normalized_gpu_ids,
+                    )
+                normalized_expired_ids = tuple(sorted(set(expired_reservation_ids)))
+                if normalized_expired_ids:
+                    placeholders = ','.join('?' for _ in normalized_expired_ids)
+                    connection.execute(
+                        f'DELETE FROM reservations WHERE reservation_id IN ({placeholders})',
+                        normalized_expired_ids,
+                    )
+                cursor = connection.execute(
+                    'DELETE FROM reservations WHERE reservation_id = ?',
+                    (reservation_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO state(key, value, updated_at) VALUES('control_plane', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (value, now),
+                )
+            except Exception:
+                connection.execute('ROLLBACK')
+                raise
+            connection.execute('COMMIT')
+        return cursor.rowcount > 0
+
+    def renew_reservation(self, reservation_id: str, expires_at: float, now: float) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reservations
+                SET expires_at = ?
+                WHERE reservation_id = ? AND expires_at > ?
+                """,
+                (expires_at, reservation_id, now),
+            )
+        return cursor.rowcount > 0
+
+    def load_reservations(self) -> list[dict[str, str | float]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at
+                FROM reservations
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finalize_settlement(
         self,
         window_id: str,
         started_at: float,
         ended_at: float,
         hotkey_rewards: Mapping[str, str],
         metadata: Mapping[str, Any],
+        next_state: Mapping[str, Any],
     ) -> bool:
+        """Atomically write one settlement and advance its accounting checkpoint."""
+        value = json.dumps(next_state, sort_keys=True, separators=(',', ':'))
+        created_at = time.time()
         with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
             try:
                 connection.execute(
                     """
@@ -111,11 +241,20 @@ class SQLiteStateStore:
                         ended_at,
                         json.dumps(hotkey_rewards, sort_keys=True),
                         json.dumps(metadata, sort_keys=True),
-                        time.time(),
+                        created_at,
                     ),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO state(key, value, updated_at) VALUES('control_plane', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (value, created_at),
+                )
             except sqlite3.IntegrityError:
+                connection.execute('ROLLBACK')
                 return False
+            connection.execute('COMMIT')
         return True
 
     def latest_settlement(self, max_age_seconds: float, *, now: float | None = None) -> dict[str, Any] | None:

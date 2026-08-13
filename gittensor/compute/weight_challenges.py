@@ -6,12 +6,17 @@ import hashlib
 import json
 import secrets
 import threading
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import quote
 
+from gittensor.compute.auth import ValidatorRequestSigner
+from gittensor.compute.http_json import load_json_object
 from gittensor.compute.models import GPURecord, Release
+from gittensor.compute.safe_http import public_https_get_follow_redirects, public_https_request
+
+_MAX_CHALLENGE_RESPONSE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -54,10 +59,20 @@ class HuggingFaceRangeSource:
         self.timeout_seconds = timeout_seconds
 
     def fetch(self, repository: str, revision: str, path: str, start: int, end: int) -> bytes:
-        url = f'https://huggingface.co/{repository}/resolve/{revision}/{path}'
-        request = urllib.request.Request(url, headers={'Range': f'bytes={start}-{end - 1}'})
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            contents = response.read()
+        url = f'https://huggingface.co/{quote(repository, safe="/")}/resolve/{revision}/{quote(path, safe="/")}'
+        response = public_https_get_follow_redirects(
+            url,
+            headers={'Range': f'bytes={start}-{end - 1}'},
+            timeout=self.timeout_seconds,
+        )
+        try:
+            content_range = response.headers.get('Content-Range', '')
+            expected_prefix = f'bytes {start}-{end - 1}/'
+            if response.status != 206 or not content_range.startswith(expected_prefix):
+                raise ValueError('Hugging Face did not honor the exact model-weight range request')
+            contents = response.read(end - start + 1)
+        finally:
+            response.close()
         expected_length = end - start
         if len(contents) != expected_length:
             raise ValueError(f'Hugging Face range returned {len(contents)} bytes, expected {expected_length}')
@@ -71,23 +86,33 @@ class WeightChallengeTransport(Protocol):
 class HTTPWeightChallengeTransport:
     """Send a challenge directly to the assigned miner runtime agent."""
 
-    def __init__(self, timeout_seconds: float, bearer_token: str | None = None) -> None:
+    def __init__(self, timeout_seconds: float, signer: ValidatorRequestSigner) -> None:
         self.timeout_seconds = timeout_seconds
-        self.bearer_token = bearer_token
+        self.signer = signer
 
     def answer(self, record: GPURecord, challenge: WeightChallenge) -> str:
-        url = f'{record.registration.endpoint.rstrip("/")}/v1/gittensor/challenges/weights'
+        endpoint = record.registration.endpoint.rstrip('/')
+        path = '/v1/gittensor/challenges/weights'
+        url = f'{endpoint}{path}'
+        payload = challenge.public_payload()
         headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
-        if self.bearer_token:
-            headers['Authorization'] = f'Bearer {self.bearer_token}'
-        request = urllib.request.Request(
+        headers.update(self.signer.headers('POST', path, payload))
+        response = public_https_request(
             url,
-            data=json.dumps(challenge.public_payload(), separators=(',', ':')).encode(),
+            body=json.dumps(payload, separators=(',', ':')).encode(),
             headers=headers,
             method='POST',
+            timeout=self.timeout_seconds,
         )
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            payload = json.loads(response.read().decode())
+        try:
+            if response.status >= 300:
+                raise ValueError(f'miner weight challenge returned HTTP {response.status}')
+            body = response.read(_MAX_CHALLENGE_RESPONSE_BYTES + 1)
+            if len(body) > _MAX_CHALLENGE_RESPONSE_BYTES:
+                raise ValueError('miner weight challenge response exceeds 64 KiB')
+            payload = load_json_object(body)
+        finally:
+            response.close()
         digest = str(payload.get('sha256') or '')
         if len(digest) != 64:
             raise ValueError('miner returned an invalid weight challenge digest')

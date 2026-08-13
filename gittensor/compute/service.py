@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal
 from enum import Enum
@@ -13,13 +14,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import bittensor as bt
+
 from gittensor.compute.artifacts import CosignReleaseVerifier
 from gittensor.compute.assignment import HTTPAssignmentExecutor
-from gittensor.compute.auth import AuthenticationError, HotkeyAuthenticator, LiveMetagraphResolver
+from gittensor.compute.auth import AuthenticationError, HotkeyAuthenticator, HotkeyRequestSigner, LiveMetagraphResolver
 from gittensor.compute.config import load_compute_config
 from gittensor.compute.control_plane import ComputeControlPlane
+from gittensor.compute.emission_oracle import SubnetEmissionOracle
+from gittensor.compute.http_json import load_json_object, read_json_object
 from gittensor.compute.models import GPUState, Release, RoutingObservation, RuntimeEvidence
 from gittensor.compute.routing import CapacityUnavailable
+from gittensor.compute.settlement_auth import SettlementSigner
 from gittensor.compute.storage import SQLiteStateStore
 from gittensor.compute.supervisor import ComputeSupervisor
 from gittensor.compute.weight_challenges import (
@@ -43,6 +49,7 @@ def make_handler(
     control_plane: ComputeControlPlane,
     bearer_token: str | None,
     miner_authenticator: HotkeyAuthenticator | None = None,
+    gateway_token: str | None = None,
 ):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'gittensor-compute/0.2'
@@ -55,10 +62,22 @@ def make_handler(
             if self.path == '/health':
                 self._send(HTTPStatus.OK, {'status': 'ok'})
                 return
-            if not self._authorized():
+            if self.path == '/v1/settlements/latest':
+                settlement = control_plane.latest_settlement()
+                if settlement is None:
+                    self._send(HTTPStatus.NOT_FOUND, {'error': 'no_fresh_settlement'})
+                else:
+                    self._send(HTTPStatus.OK, settlement)
                 return
             if self.path == '/v1/status':
+                if not self._authorized(bearer_token):
+                    return
                 self._send(HTTPStatus.OK, control_plane.status())
+                return
+            if self.path == '/v1/catalog':
+                if not self._authorized(gateway_token, allow_operator=True):
+                    return
+                self._send(HTTPStatus.OK, {'releases': control_plane.catalog()})
                 return
             self._send(HTTPStatus.NOT_FOUND, {'error': 'not found'})
 
@@ -66,16 +85,36 @@ def make_handler(
             try:
                 payload = self._read_json()
                 miner = None
-                if self.path in {'/v1/gpus', '/v1/gpus/telemetry', '/v1/assignments/ack'}:
+                if self.path in {'/v1/gpus', '/v1/assignments/ack'}:
                     if miner_authenticator is None:
                         raise AuthenticationError('miner hotkey authentication is not configured')
                     auth = payload.pop('auth', None)
                     if not isinstance(auth, dict):
                         raise AuthenticationError('request requires an auth object')
                     miner = miner_authenticator.authenticate('POST', self.path, payload, auth)
-                elif not self._authorized():
+                elif self.path in {
+                    '/v1/route',
+                    '/v1/reservations/complete',
+                    '/v1/reservations/renew',
+                    '/v1/observations',
+                }:
+                    if not self._authorized(gateway_token, allow_operator=True):
+                        return
+                elif not self._authorized(bearer_token):
                     return
-                if self.path == '/v1/releases':
+                if self.path == '/v1/gpus/disable':
+                    self._require_keys(payload, required={'gpu_id', 'reason'}, optional=set())
+                    control_plane.disable_gpu(payload['gpu_id'], payload['reason'])
+                    self._send(HTTPStatus.OK, {'status': 'disabled'})
+                elif self.path == '/v1/gpus/enable':
+                    self._require_keys(payload, required={'gpu_id'}, optional=set())
+                    control_plane.enable_gpu(payload['gpu_id'])
+                    self._send(HTTPStatus.OK, {'status': 'enabled'})
+                elif self.path == '/v1/releases/revoke':
+                    self._require_keys(payload, required={'release_digest', 'reason'}, optional=set())
+                    control_plane.revoke_release(payload['release_digest'], payload['reason'])
+                    self._send(HTTPStatus.OK, {'status': 'revoked'})
+                elif self.path == '/v1/releases':
                     self._require_keys(
                         payload,
                         required={
@@ -84,6 +123,7 @@ def make_handler(
                             'runtime_digest',
                             'model_repository',
                             'model_revision',
+                            'tokenizer_repository',
                             'tokenizer_revision',
                             'container_image',
                             'container_digest',
@@ -110,15 +150,6 @@ def make_handler(
                         **payload,
                     )
                     self._send(HTTPStatus.CREATED, {'status': 'registered'})
-                elif self.path == '/v1/gpus/telemetry':
-                    self._require_keys(
-                        payload,
-                        required={'gpu_id', 'active_slots', 'remaining_work_seconds'},
-                        optional=set(),
-                    )
-                    assert miner is not None
-                    control_plane.update_gpu_telemetry(miner_hotkey=miner.hotkey, **payload)
-                    self._send(HTTPStatus.OK, {'status': 'recorded'})
                 elif self.path == '/v1/assignments/ack':
                     self._require_keys(
                         payload,
@@ -143,12 +174,24 @@ def make_handler(
                     self._send(HTTPStatus.OK, {'gpus': control_plane.refresh_verification()})
                 elif self.path == '/v1/control/tick':
                     self._require_keys(payload, required=set(), optional=set())
-                    self._send(HTTPStatus.OK, control_plane.tick())
+                    self._send(HTTPStatus.OK, control_plane.tick(execute=True))
                 elif self.path == '/v1/funding':
-                    self._require_keys(payload, required={'max_budget_per_hour'}, optional=set())
+                    self._require_keys(
+                        payload,
+                        required={'max_budget_per_hour'},
+                        optional={'subnet_miner_emission_value_per_hour'},
+                    )
+                    budget = payload['max_budget_per_hour']
                     self._send(
                         HTTPStatus.OK,
-                        control_plane.update_budget(float(payload['max_budget_per_hour'])),
+                        control_plane.update_budget(
+                            float(budget) if budget is not None else None,
+                            subnet_miner_emission_value_per_hour=(
+                                float(payload['subnet_miner_emission_value_per_hour'])
+                                if payload.get('subnet_miner_emission_value_per_hour') is not None
+                                else None
+                            ),
+                        ),
                     )
                 elif self.path == '/v1/route':
                     self._require_keys(
@@ -161,10 +204,18 @@ def make_handler(
                     self._require_keys(payload, required={'reservation_id'}, optional=set())
                     completed = control_plane.complete_reservation(payload['reservation_id'])
                     self._send(HTTPStatus.OK, {'completed': completed})
+                elif self.path == '/v1/reservations/renew':
+                    self._require_keys(payload, required={'reservation_id'}, optional=set())
+                    expires_at = control_plane.renew_reservation(payload['reservation_id'])
+                    if expires_at is None:
+                        self._send(HTTPStatus.NOT_FOUND, {'error': 'reservation_not_live'})
+                    else:
+                        self._send(HTTPStatus.OK, {'renewed': True, 'expires_at': expires_at})
                 elif self.path == '/v1/observations':
                     self._require_keys(
                         payload,
                         required={
+                            'reservation_id',
                             'gpu_id',
                             'requester_region',
                             'measured_rtt_ms',
@@ -172,18 +223,13 @@ def make_handler(
                             'success',
                             'observed_active_slots',
                             'remaining_work_seconds',
+                            'expected_service_seconds',
+                            'release_digest',
                         },
                         optional=set(),
                     )
                     control_plane.record_routing_observation(RoutingObservation(**payload))
                     self._send(HTTPStatus.OK, {'status': 'recorded'})
-                elif self.path == '/v1/settlement':
-                    self._require_keys(payload, required=set(), optional=set())
-                    result, miner_rewards = control_plane.settle()
-                    self._send(
-                        HTTPStatus.OK,
-                        {'settlement': result, 'miner_rewards': miner_rewards},
-                    )
                 else:
                     self._send(HTTPStatus.NOT_FOUND, {'error': 'not found'})
             except CapacityUnavailable as exc:
@@ -198,22 +244,24 @@ def make_handler(
             except Exception as exc:
                 self._send(HTTPStatus.BAD_GATEWAY, {'error': 'upstream_failure', 'message': str(exc)})
 
-        def _authorized(self) -> bool:
-            if bearer_token is None:
+        def _authorized(self, required_token: str | None, *, allow_operator: bool = False) -> bool:
+            if required_token is None:
                 return True
-            if self.headers.get('Authorization') == f'Bearer {bearer_token}':
+            authorization = self.headers.get('Authorization')
+            if isinstance(authorization, str) and secrets.compare_digest(authorization, f'Bearer {required_token}'):
+                return True
+            if (
+                allow_operator
+                and bearer_token is not None
+                and isinstance(authorization, str)
+                and secrets.compare_digest(authorization, f'Bearer {bearer_token}')
+            ):
                 return True
             self._send(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
             return False
 
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get('Content-Length', '0'))
-            if length > 64 * 1024:
-                raise ValueError('request body exceeds 64 KiB')
-            payload = json.loads(self.rfile.read(length) or b'{}')
-            if not isinstance(payload, dict):
-                raise ValueError('request body must be a JSON object')
-            return payload
+            return read_json_object(self.rfile, self.headers, 64 * 1024)
 
         @staticmethod
         def _require_keys(
@@ -241,47 +289,47 @@ def make_handler(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Run the Gittensor compute control plane')
-    parser.add_argument('--config', required=True, help='path to compute JSON configuration')
-    parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', type=int, default=8780)
-    parser.add_argument('--token-env', default='GITTENSOR_COMPUTE_TOKEN')
-    parser.add_argument(
-        '--allow-insecure-local',
-        action='store_true',
-        help='allow startup without an API token when bound to a loopback address',
-    )
-    return parser
+    from gittensor.compute.entrypoints import control_plane_parser
+
+    return control_plane_parser()
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def main(args: argparse.Namespace | None = None) -> None:
+    args = args or build_parser().parse_args()
     token = os.environ.get(args.token_env)
+    gateway_token = os.environ.get(args.gateway_token_env)
     loopback = args.host in {'127.0.0.1', '::1', 'localhost'}
     if not token and not (args.allow_insecure_local and loopback):
         raise SystemExit(f'{args.token_env} must be set unless --allow-insecure-local is used on loopback')
+    if not gateway_token and not (args.allow_insecure_local and loopback):
+        raise SystemExit(f'{args.gateway_token_env} must be set unless --allow-insecure-local is used on loopback')
     config = load_compute_config(args.config)
     if not config.identity.spark_node_owners_path:
         raise SystemExit('identity.spark_node_owners_path must point to the verifier enrollment map')
     owners_path = Path(config.identity.spark_node_owners_path)
     try:
-        spark_node_owners = json.loads(owners_path.read_text())
+        spark_node_owners = load_json_object(owners_path.read_bytes())
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f'failed to load SparkCompute ownership map: {exc}') from exc
-    if not isinstance(spark_node_owners, dict) or not all(
-        isinstance(key, str) and isinstance(value, str) for key, value in spark_node_owners.items()
+    if (
+        not isinstance(spark_node_owners, dict)
+        or not spark_node_owners
+        or not all(isinstance(key, str) and isinstance(value, str) for key, value in spark_node_owners.items())
     ):
-        raise SystemExit('SparkCompute ownership map must be a JSON object of node_id -> hotkey')
+        raise SystemExit('SparkCompute ownership map must be a non-empty JSON object of node_id -> hotkey')
     store = SQLiteStateStore(config.state.database_path)
-    assignment_token = (
-        os.environ.get(config.assignment.bearer_token_env) if config.assignment.bearer_token_env else None
+    validator_wallet = bt.Wallet(
+        name=config.assignment.validator_wallet_name,
+        hotkey=config.assignment.validator_wallet_hotkey,
+        path=config.assignment.validator_wallet_path,
     )
-    assignment_executor = HTTPAssignmentExecutor(config.assignment.request_timeout_seconds, assignment_token)
+    command_signer = HotkeyRequestSigner(validator_wallet.hotkey)
+    assignment_executor = HTTPAssignmentExecutor(config.assignment.request_timeout_seconds, command_signer)
     weight_verifier = WeightChallengeVerifier(
         HuggingFaceRangeSource(config.verification.timeout_seconds),
         config.verification.weight_challenge_ttl_seconds,
     )
-    weight_transport = HTTPWeightChallengeTransport(config.assignment.request_timeout_seconds, assignment_token)
+    weight_transport = HTTPWeightChallengeTransport(config.assignment.request_timeout_seconds, command_signer)
     artifact_verifier = (
         CosignReleaseVerifier(
             config.verification.cosign_binary,
@@ -298,6 +346,7 @@ def main() -> None:
         weight_transport=weight_transport,
         spark_node_owners=spark_node_owners,
         release_artifact_verifier=artifact_verifier,
+        settlement_signer=SettlementSigner(validator_wallet.hotkey),
     )
     resolver = LiveMetagraphResolver(
         config.identity.netuid,
@@ -307,9 +356,19 @@ def main() -> None:
     authenticator = HotkeyAuthenticator(resolver, store, config.identity.signature_ttl_seconds)
     server = ThreadingHTTPServer(
         (args.host, args.port),
-        make_handler(control_plane, token, authenticator),
+        make_handler(control_plane, token, authenticator, gateway_token),
     )
-    supervisor = ComputeSupervisor(control_plane)
+    emission_oracle = (
+        SubnetEmissionOracle(
+            config.emission_oracle,
+            netuid=config.identity.netuid,
+            network=config.identity.network,
+            target_currency=config.fleet.target_price_currency,
+        )
+        if config.emission_oracle.enabled
+        else None
+    )
+    supervisor = ComputeSupervisor(control_plane, emission_oracle=emission_oracle)
     supervisor.start()
     print(f'gittensor compute control plane listening on http://{args.host}:{args.port}', flush=True)
     try:

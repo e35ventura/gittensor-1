@@ -56,11 +56,25 @@ expected_completion_seconds
 effective_ready_gpus
 unspent_budget
 evidence_digest
+price_block
 _.row_factory
 StaticIdentityResolver
-HMACStreamVerifier
+_.sock
+RuntimeStreamSigner
+__getattr__
+control_plane_main
+miner_main
+gateway_main
+runtime_proxy_main
+failobj
+file_pointer
+new_url
 
 # BaseHTTPRequestHandler discovers these names dynamically.
 _.server_version
 _.do_GET
 _.do_POST
+_.close_connection
+
+# urllib's opener discovers redirect handlers dynamically.
+_.redirect_request

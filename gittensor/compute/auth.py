@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -21,6 +22,19 @@ def canonical_request(method: str, path: str, payload: Mapping[str, Any], timest
     body = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     digest = hashlib.sha256(body.encode()).hexdigest()
     return f'gittensor-compute-v1\n{method.upper()}\n{path}\n{timestamp}\n{nonce}\n{digest}'.encode()
+
+
+def canonical_validator_command(
+    method: str,
+    path: str,
+    payload: Mapping[str, Any],
+    timestamp: int,
+    nonce: str,
+) -> bytes:
+    """Bind a validator command to its method, path, body, time, and nonce."""
+    body = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    return f'gittensor-validator-command-v1\n{method.upper()}\n{path}\n{timestamp}\n{nonce}\n{digest}'.encode()
 
 
 @dataclass(frozen=True)
@@ -68,6 +82,99 @@ class LiveMetagraphResolver:
 
 class NonceStore(Protocol):
     def consume_nonce(self, hotkey: str, nonce: str, expires_at: float) -> bool: ...
+
+
+class ValidatorRequestSigner(Protocol):
+    def headers(self, method: str, path: str, payload: Mapping[str, Any]) -> Mapping[str, str]: ...
+
+
+class HotkeyRequestSigner:
+    """Sign control-plane commands with the validator hotkey."""
+
+    def __init__(self, keypair: bt.Keypair, *, clock=time.time) -> None:
+        self.keypair = keypair
+        self.clock = clock
+
+    def headers(self, method: str, path: str, payload: Mapping[str, Any]) -> Mapping[str, str]:
+        timestamp = int(self.clock())
+        nonce = secrets.token_hex(32)
+        signature = self.keypair.sign(canonical_validator_command(method, path, payload, timestamp, nonce))
+        return {
+            'X-Gittensor-Validator': self.keypair.ss58_address,
+            'X-Gittensor-Timestamp': str(timestamp),
+            'X-Gittensor-Nonce': nonce,
+            'X-Gittensor-Signature': f'0x{signature.hex()}',
+        }
+
+
+class MinerRequestSigner:
+    """Attach the auth object expected by miner-owned control-plane endpoints."""
+
+    def __init__(self, keypair: bt.Keypair, *, clock=time.time) -> None:
+        self.keypair = keypair
+        self.clock = clock
+
+    def sign(self, method: str, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        timestamp = int(self.clock())
+        nonce = secrets.token_hex(32)
+        signature = self.keypair.sign(canonical_request(method, path, payload, timestamp, nonce))
+        return {
+            **payload,
+            'auth': {
+                'hotkey': self.keypair.ss58_address,
+                'timestamp': timestamp,
+                'nonce': nonce,
+                'signature': f'0x{signature.hex()}',
+            },
+        }
+
+
+class ValidatorCommandAuthenticator:
+    """Verify commands from one configured validator hotkey with replay protection."""
+
+    def __init__(
+        self,
+        expected_hotkey: str,
+        nonce_store: NonceStore,
+        ttl_seconds: float,
+        *,
+        clock=time.time,
+    ) -> None:
+        self.expected_hotkey = expected_hotkey
+        self.nonce_store = nonce_store
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock
+
+    def authenticate(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> None:
+        hotkey = str(headers.get('X-Gittensor-Validator') or '')
+        nonce = str(headers.get('X-Gittensor-Nonce') or '')
+        signature_hex = str(headers.get('X-Gittensor-Signature') or '')
+        try:
+            timestamp = int(headers.get('X-Gittensor-Timestamp') or '')
+        except ValueError:
+            raise AuthenticationError('validator command timestamp must be an integer') from None
+        if hotkey != self.expected_hotkey:
+            raise AuthenticationError('validator command was not signed by the configured hotkey')
+        if not nonce or not signature_hex:
+            raise AuthenticationError('validator command requires a nonce and signature')
+        now = self.clock()
+        if abs(now - timestamp) > self.ttl_seconds:
+            raise AuthenticationError('validator command signature is stale or too far in the future')
+        try:
+            signature = bytes.fromhex(signature_hex.removeprefix('0x'))
+        except ValueError:
+            raise AuthenticationError('validator command signature must be hexadecimal') from None
+        message = canonical_validator_command(method, path, payload, timestamp, nonce)
+        if not bt.Keypair(ss58_address=hotkey).verify(message, signature):
+            raise AuthenticationError('invalid validator command signature')
+        if not self.nonce_store.consume_nonce(hotkey, nonce, now + self.ttl_seconds):
+            raise AuthenticationError('validator command nonce has already been used')
 
 
 class HotkeyAuthenticator:

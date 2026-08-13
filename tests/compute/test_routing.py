@@ -10,7 +10,7 @@ def _gpu(index, rtt_ms=10):
         release_digest='release:1',
         performance_class='rtx-5090',
         certified_slots=4,
-        reported_active_slots=0,
+        observed_active_slots=0,
         remaining_work_seconds=0,
         service_seconds=1,
         rtt_ms=rtt_ms,
@@ -44,7 +44,7 @@ def test_expected_completion_beats_idle_status():
         release_digest='release:1',
         performance_class='rtx-5090',
         certified_slots=4,
-        reported_active_slots=1,
+        observed_active_slots=1,
         remaining_work_seconds=0.1,
         service_seconds=0.1,
         rtt_ms=10,
@@ -55,7 +55,7 @@ def test_expected_completion_beats_idle_status():
         release_digest='release:1',
         performance_class='rtx-5090',
         certified_slots=4,
-        reported_active_slots=0,
+        observed_active_slots=0,
         remaining_work_seconds=0,
         service_seconds=0.1,
         rtt_ms=5_000,
@@ -65,3 +65,26 @@ def test_expected_completion_beats_idle_status():
 
     assert decision.gpu_id == 'local'
     assert decision.expected_completion_seconds == pytest.approx(0.21)
+
+
+def test_free_concurrency_slot_does_not_add_serial_wait_time_and_long_requests_keep_their_slot():
+    router = FastestFinishRouter(reservation_ttl_seconds=10)
+    gpu = _gpu(0)
+    first = router.route([gpu], 'release:1', now=0)
+    second = router.route([gpu], 'release:1', now=0.5)
+
+    assert first.expires_at == 31
+    assert second.expected_completion_seconds == pytest.approx(1.01)
+
+
+def test_live_reservation_can_be_renewed_but_expired_one_cannot():
+    router = FastestFinishRouter(reservation_ttl_seconds=5)
+    gpu = _gpu(0)
+    reservation = router.route([gpu], 'release:1', now=0)
+
+    assert reservation.expires_at == 31
+    assert router.renew(reservation.reservation_id, now=4) == 31
+    assert router.renew(reservation.reservation_id, now=30) == 35
+    assert router.active_counts(now=34) == {'gpu-0': 1}
+    assert router.renew(reservation.reservation_id, now=35) is None
+    assert router.active_counts(now=35) == {}

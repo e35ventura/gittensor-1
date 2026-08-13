@@ -6,7 +6,9 @@ import pytest
 from gittensor.compute.auth import (
     AuthenticationError,
     HotkeyAuthenticator,
+    HotkeyRequestSigner,
     StaticIdentityResolver,
+    ValidatorCommandAuthenticator,
     canonical_request,
 )
 from gittensor.compute.storage import SQLiteStateStore
@@ -57,3 +59,39 @@ def test_signature_is_bound_to_exact_request_payload(tmp_path):
                 'signature': signature,
             },
         )
+
+
+def test_validator_command_signature_is_role_bound_and_replay_safe(tmp_path):
+    keypair = bt.Keypair.create_from_uri('//Alice')
+    now = int(time.time())
+    payload = {'gpu_id': 'gpu-1', 'epoch': 3}
+    signer = HotkeyRequestSigner(keypair, clock=lambda: now)
+    headers = signer.headers('POST', '/v1/gittensor/assignments', payload)
+    authenticator = ValidatorCommandAuthenticator(
+        keypair.ss58_address,
+        SQLiteStateStore(tmp_path / 'agent.sqlite3'),
+        30,
+        clock=lambda: now,
+    )
+
+    authenticator.authenticate('POST', '/v1/gittensor/assignments', payload, headers)
+
+    with pytest.raises(AuthenticationError, match='already been used'):
+        authenticator.authenticate('POST', '/v1/gittensor/assignments', payload, headers)
+
+
+def test_validator_command_rejects_different_validator(tmp_path):
+    trusted = bt.Keypair.create_from_uri('//Alice')
+    attacker = bt.Keypair.create_from_uri('//Bob')
+    now = int(time.time())
+    payload = {'gpu_id': 'gpu-1'}
+    headers = HotkeyRequestSigner(attacker, clock=lambda: now).headers('POST', '/command', payload)
+    authenticator = ValidatorCommandAuthenticator(
+        trusted.ss58_address,
+        SQLiteStateStore(tmp_path / 'agent.sqlite3'),
+        30,
+        clock=lambda: now,
+    )
+
+    with pytest.raises(AuthenticationError, match='configured hotkey'):
+        authenticator.authenticate('POST', '/command', payload, headers)

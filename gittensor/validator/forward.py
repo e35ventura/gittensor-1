@@ -9,7 +9,7 @@ import bittensor as bt
 from gittensor.classes import MinerEvaluation, MinerEvaluationCache
 from gittensor.utils.mirror.client import MirrorClient, MirrorRequestError
 from gittensor.utils.uids import get_all_uids
-from gittensor.validator.compute_rewards import load_compute_scores
+from gittensor.validator.compute_rewards import load_compute_allocation
 from gittensor.validator.emission_allocation import blend_emission_pools
 from gittensor.validator.issue_competitions.forward import issue_competitions
 from gittensor.validator.issue_discovery.scan import run_issue_discovery
@@ -77,16 +77,25 @@ async def forward(self: 'Validator') -> None:
 
         # 5. Allocate repo-bounded emission shares into final rewards
         maintainer_uids_by_repo = build_maintainer_uids_by_repo(miner_evaluations, master_repositories, miner_uids)
-        compute_scores = load_compute_scores(self.metagraph.hotkeys)
+        compute_allocation = load_compute_allocation(self.metagraph.hotkeys)
         rewards = blend_emission_pools(
             miner_evaluations,
             master_repositories,
             miner_uids,
             maintainer_uids_by_repo,
-            compute_scores,
+            compute_allocation.scores if compute_allocation is not None else None,
+            compute_allocation.emission_share if compute_allocation is not None else None,
         )
 
-        self.update_scores(rewards, miner_uids, blacklisted_uids=sorted(penalized_uids))
+        # These are already normalized emission allocations. Applying the base
+        # neuron's EMA here would distort the target-price compute percentage
+        # and continue paying hardware after it leaves READY.
+        self.update_scores(
+            rewards,
+            miner_uids,
+            blacklisted_uids=sorted(penalized_uids),
+            alpha_override=1.0,
+        )
 
     await asyncio.sleep(VALIDATOR_WAIT)
 

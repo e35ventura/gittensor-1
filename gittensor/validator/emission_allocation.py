@@ -3,6 +3,7 @@
 
 """Round-level emission allocation by repository emission shares."""
 
+import math
 from typing import Dict, Iterator, Optional
 
 import bittensor as bt
@@ -14,6 +15,7 @@ from gittensor.constants import (
     EMISSION_SHARE_TOLERANCE,
     ISSUES_TREASURY_EMISSION_SHARE,
     ISSUES_TREASURY_UID,
+    MAX_COMPUTE_EMISSION_SHARE,
     OSS_EMISSION_SHARE,
     RECYCLE_UID,
 )
@@ -26,6 +28,7 @@ def blend_emission_pools(
     miner_uids: set[int],
     maintainer_uids_by_repo: Optional[Dict[str, list[int]]] = None,
     compute_scores: Optional[Dict[int, float]] = None,
+    compute_emission_share: Optional[float] = None,
 ) -> np.ndarray:
     """Allocate the combined scoring pool by bounded repository emission_share.
 
@@ -45,7 +48,14 @@ def blend_emission_pools(
     rewards = np.zeros(len(sorted_uids))
 
     compute_enabled = compute_scores is not None
-    oss_emission_share = OSS_EMISSION_SHARE - COMPUTE_EMISSION_SHARE if compute_enabled else OSS_EMISSION_SHARE
+    active_compute_share = (
+        max(0.0, min(MAX_COMPUTE_EMISSION_SHARE, compute_emission_share))
+        if compute_enabled and compute_emission_share is not None and math.isfinite(compute_emission_share)
+        else COMPUTE_EMISSION_SHARE
+        if compute_enabled
+        else 0.0
+    )
+    oss_emission_share = OSS_EMISSION_SHARE - active_compute_share
     total_configured_share = sum(config.emission_share for config in master_repositories.values())
     recycle_share = max(0.0, 1.0 - total_configured_share) * oss_emission_share
 
@@ -65,17 +75,17 @@ def blend_emission_pools(
             rewards[uid_index[uid]] += reward
 
     if compute_enabled:
-        eligible_scores = {
-            uid: max(0.0, float(score))
-            for uid, score in (compute_scores or {}).items()
-            if uid in miner_uids and float(score) > 0
-        }
+        eligible_scores = {}
+        for uid, score in (compute_scores or {}).items():
+            numeric_score = float(score)
+            if uid in miner_uids and math.isfinite(numeric_score) and numeric_score > 0:
+                eligible_scores[uid] = numeric_score
         score_total = sum(eligible_scores.values())
         if score_total > 0:
             for uid, score in eligible_scores.items():
-                rewards[uid_index[uid]] += COMPUTE_EMISSION_SHARE * score / score_total
+                rewards[uid_index[uid]] += active_compute_share * score / score_total
         else:
-            recycle_share += COMPUTE_EMISSION_SHARE
+            recycle_share += active_compute_share
 
     # Issue treasury (10% flat to UID 111)
     if ISSUES_TREASURY_UID > 0 and ISSUES_TREASURY_UID in miner_uids:

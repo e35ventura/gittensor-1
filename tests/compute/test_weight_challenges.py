@@ -1,7 +1,15 @@
 import hashlib
 from dataclasses import replace
 
-from gittensor.compute.inference_verification import HMACStreamVerifier, StreamProofContext
+import bittensor as bt
+import pytest
+
+from gittensor.compute.inference_verification import (
+    RuntimeStreamSigner,
+    SignedStreamVerifier,
+    StreamProofContext,
+    canonical_stream_chunk,
+)
 from gittensor.compute.models import Release
 from gittensor.compute.weight_challenges import WeightChallengeVerifier
 
@@ -18,13 +26,14 @@ def _release(contents):
     release = Release(
         release_digest='pending',
         model_id='model',
-        runtime_digest='sha256:runtime',
+        runtime_digest=f'sha256:{"1" * 64}',
         model_repository='owner/model',
         model_revision='a' * 40,
+        tokenizer_repository='owner/model',
         tokenizer_revision='b' * 40,
         container_image='registry.example/runtime',
-        container_digest='sha256:container',
-        filesystem_digest='sha256:filesystem',
+        container_digest=f'sha256:{"2" * 64}',
+        filesystem_digest=f'sha256:{"3" * 64}',
         runtime_commit='c' * 40,
         weight_files={path: len(value) for path, value in contents.items()},
     )
@@ -43,14 +52,38 @@ def test_random_weight_range_is_checked_against_independent_reference():
     assert not verifier.verify(challenge.challenge_id, 'gpu-1', digest, now=102)
 
 
-def test_stream_proof_binds_chunk_to_release_model_and_request():
-    context = StreamProofContext('request-1', 100, 'release:1', 'model', 'a' * 40)
-    verifier = HMACStreamVerifier(b's' * 32, context)
-    proof = verifier.expected_proof(0, 'hello')
+def test_production_manifest_rejects_noncanonical_artifacts_and_escaping_paths():
+    release = _release({'../escape.safetensors': b'bad'})
 
-    assert verifier.verify(0, 'hello', proof)
-    assert not verifier.verify(0, 'different', proof)
-    assert not HMACStreamVerifier(
-        b's' * 32,
-        StreamProofContext('request-1', 100, 'release:2', 'model', 'a' * 40),
-    ).verify(0, 'hello', proof)
+    with pytest.raises(ValueError, match='stay inside'):
+        release.validate_production_manifest()
+
+
+def test_attested_stream_signature_rejects_reordering_and_wrong_content():
+    keypair = bt.Keypair.create_from_uri('//Alice')
+    assert keypair.public_key is not None
+    context = StreamProofContext('request-1', 100, 'release:1', 'model', 'a' * 40)
+    verifier = SignedStreamVerifier(keypair.public_key.hex(), context)
+    first_payload = {'choices': [{'delta': {'content': 'hello'}}]}
+    second_payload = {'choices': [{'delta': {'content': ' world'}}]}
+    first = keypair.sign(canonical_stream_chunk(context, 0, first_payload)).hex()
+    second = keypair.sign(canonical_stream_chunk(context, 1, second_payload)).hex()
+
+    assert verifier.verify(0, first_payload, first)
+    assert not verifier.verify(2, second_payload, second)
+    assert verifier.verify(1, second_payload, second)
+    wrong_payload = {'choices': [{'delta': {'content': 'wrong'}}]}
+    assert not SignedStreamVerifier(keypair.public_key.hex(), context).verify(0, wrong_payload, first)
+
+
+def test_runtime_signer_and_gateway_verifier_share_the_exact_chunk_contract():
+    keypair = bt.Keypair.create_from_uri('//Alice')
+    context = StreamProofContext('request-1', 100, 'release:1', 'model', 'a' * 40)
+    signer = RuntimeStreamSigner(keypair, context)
+    verifier = SignedStreamVerifier(signer.public_key_hex, context)
+
+    payload = signer.attach({'choices': [{'delta': {'content': 'hello'}}]})
+    proof = payload['gittensor_proof']
+
+    assert isinstance(proof, dict)
+    assert verifier.verify(proof['index'], payload, proof['signature'])

@@ -30,7 +30,10 @@ debug = [
 
 [project.scripts]
 gitt = "gittensor.cli.main:main"
-gitt-compute = "gittensor.compute.service:main"
+gitt-compute = "gittensor.compute.entrypoints:control_plane_main"
+gitt-compute-miner = "gittensor.compute.entrypoints:miner_main"
+gitt-compute-gateway = "gittensor.compute.entrypoints:gateway_main"
+gitt-compute-runtime-proxy = "gittensor.compute.entrypoints:runtime_proxy_main"
 
 [build-system]
 requires = ["hatchling"]
