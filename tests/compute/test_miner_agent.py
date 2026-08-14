@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import time
 import urllib.error
 from dataclasses import asdict
@@ -374,11 +375,13 @@ def test_miner_agent_preserves_runtime_client_error_without_losing_concurrency_a
         io.BytesIO(b'{"error":"invalid prompt"}'),
     )
 
-    with patch('gittensor.compute.miner_agent.no_redirect_urlopen', side_effect=failure):
+    with patch('gittensor.compute.miner_agent.no_redirect_urlopen', side_effect=failure) as open_runtime:
         capability = _capability(command)
         response = agent.open_inference(payload, capability)
         assert response.code == HTTPStatus.UNPROCESSABLE_ENTITY.value
         assert agent.status()['active_inference'] == 1
+        forwarded = open_runtime.call_args.args[0]
+        assert json.loads(forwarded.data)['max_tokens'] == 256
         response.close()
         agent.close_inference(capability.reserved_kv_bytes)
 

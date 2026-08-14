@@ -30,7 +30,7 @@ from gittensor.compute.inference_tokens import InferenceCapability, verify_infer
 from gittensor.compute.inference_verification import canonical_request_digest
 from gittensor.compute.miner_runtime import ContainerRuntimeConfig, ContainerRuntimeManager, RuntimeManager
 from gittensor.compute.models import AssignmentCommand, GPUState, RuntimeEvidence
-from gittensor.compute.request_capacity import estimate_request_capacity
+from gittensor.compute.request_capacity import estimate_request_capacity, normalize_openai_request
 from gittensor.compute.safe_http import no_redirect_urlopen, validate_https_or_loopback_origin
 
 _MAX_CONTROL_RESPONSE_BYTES = 64 * 1024
@@ -435,6 +435,7 @@ class MinerRuntimeAgent:
             if request_payload.get('model') != command.model_id:
                 raise ValueError('inference request does not target the assigned model')
             try:
+                request_payload = normalize_openai_request(request_payload)
                 request_capacity = estimate_request_capacity(
                     request_payload,
                     request_overhead_tokens=command.request_overhead_tokens,

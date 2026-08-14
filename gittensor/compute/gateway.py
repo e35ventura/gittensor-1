@@ -24,7 +24,7 @@ from gittensor.compute.inference_verification import (
     StreamProofContext,
     canonical_request_digest,
 )
-from gittensor.compute.request_capacity import estimate_request_capacity
+from gittensor.compute.request_capacity import estimate_request_capacity, normalize_openai_request
 from gittensor.compute.safe_http import no_redirect_urlopen, public_https_request, validate_https_or_loopback_origin
 
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -114,6 +114,10 @@ class InferenceGateway:
         # must always receive its canonical model ID. Never let a caller choose a
         # different model inside a multi-model backend.
         runtime_request['model'] = release['model_id']
+        try:
+            runtime_request = normalize_openai_request(runtime_request)
+        except ValueError as exc:
+            raise GatewayError(400, str(exc)) from exc
         estimated_input_tokens, max_output_tokens, expected_seconds = self._estimate_request(
             runtime_request,
             release,

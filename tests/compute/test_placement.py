@@ -49,6 +49,25 @@ def test_minimum_residency_prevents_assignment_thrashing():
     assert plan.transitions == ()
 
 
+def test_missing_minimum_replica_preempts_assignment_residency():
+    gpu = _gpu(0, 'a')
+    gpu.assignment_started_at = 95
+    plan = GlobalGepetto(minimum_residency_seconds=900).plan(
+        [gpu],
+        [
+            Release('a', 'model-a', 'runtime-a'),
+            Release('b', 'model-b', 'runtime-b', minimum_replicas=1),
+        ],
+        [],
+        now=100,
+    )
+
+    assert plan.assignments == {'gpu-0': 'b'}
+    assert plan.replica_counts == {'a': 0, 'b': 1}
+    assert len(plan.transitions) == 1
+    assert plan.transitions[0].to_release == 'b'
+
+
 def test_demand_switch_requires_a_persisted_sustained_shortage():
     releases = [Release('a', 'model-a', 'runtime-a'), Release('b', 'model-b', 'runtime-b')]
     gpus = [_gpu(0, 'a'), _gpu(1, 'a')]

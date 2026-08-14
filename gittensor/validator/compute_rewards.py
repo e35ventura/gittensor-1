@@ -106,7 +106,7 @@ def _allocation_from_settlement(
     rewards = settlement.get('hotkey_rewards')
     metadata = settlement.get('metadata')
     if not isinstance(rewards, dict) or not isinstance(metadata, dict):
-        return ComputeAllocation({}, 0.0, 0.0)
+        return ComputeAllocation({}, 0.0, COMPUTE_EMISSION_SHARE)
     for hotkey, raw_amount in rewards.items():
         uid = uid_by_hotkey.get(hotkey)
         if uid is None:

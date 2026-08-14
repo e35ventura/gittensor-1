@@ -7,7 +7,7 @@ import pytest
 from gittensor.compute.settlement_auth import SettlementSigner
 from gittensor.compute.storage import SQLiteStateStore
 from gittensor.constants import COMPUTE_EMISSION_SHARE, ISSUES_TREASURY_UID, RECYCLE_UID
-from gittensor.validator.compute_rewards import load_compute_allocation
+from gittensor.validator.compute_rewards import _allocation_from_settlement, load_compute_allocation
 from gittensor.validator.emission_allocation import blend_emission_pools
 
 
@@ -187,6 +187,21 @@ def test_non_finite_settlement_values_cannot_poison_validator_weights(tmp_path):
     allocation = load_compute_allocation(['recycle', 'miner-hotkey'], database_path=str(path))
 
     assert allocation is not None
+    assert allocation.scores == {}
+    assert allocation.emission_share == 0.0
+    assert allocation.reserved_emission_share == COMPUTE_EMISSION_SHARE
+
+
+@pytest.mark.parametrize(
+    'settlement',
+    [
+        {'hotkey_rewards': [], 'metadata': {'compute_reserved_emission_share': 0.0}},
+        {'hotkey_rewards': {'miner-hotkey': '1'}, 'metadata': []},
+    ],
+)
+def test_malformed_fresh_settlement_recycles_the_baseline_compute_slice(settlement):
+    allocation = _allocation_from_settlement(['recycle', 'miner-hotkey'], settlement)
+
     assert allocation.scores == {}
     assert allocation.emission_share == 0.0
     assert allocation.reserved_emission_share == COMPUTE_EMISSION_SHARE

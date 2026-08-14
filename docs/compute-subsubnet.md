@@ -207,7 +207,7 @@ NVIDIA's current [Trusted Computing supported-SKU list](https://docs.nvidia.com/
 
 ## Fastest-finish routing
 
-Only READY GPUs with a live verification lease, the exact release, free certified concurrency and enough unreserved KV bytes are candidates. The gateway and miner use the same deterministic byte-level upper bound for request context. Each reservation records its KV bytes and GPU fraction, and the one-use HMAC capability binds the KV amount. The miner recomputes the actual request requirement and rejects any request larger than its signed reservation.
+Only READY GPUs with a live verification lease, the exact release, free certified concurrency and enough unreserved KV bytes are candidates. Before routing, the gateway converts `max_completion_tokens` to one canonical `max_tokens` cap and inserts a 256-token cap when neither field is supplied. Requests that set both fields or request `n != 1` are rejected with HTTP 400 because their exact KV use cannot be reserved. The gateway and miner use the same deterministic byte-level upper bound for request context, and the miner independently repeats the normalization. Each reservation records its KV bytes and GPU fraction, and the one-use HMAC capability binds the KV amount. The miner rejects any request larger than its signed reservation.
 
 ```text
 predicted finish = measured gateway RTT
@@ -265,7 +265,7 @@ Co-located validators may read `GITTENSOR_COMPUTE_DB`. Remote validators use `GI
 1. Map settlement hotkeys onto the current metagraph.
 2. Read the target-scaled compute emission share from the atomic settlement.
 3. Normalize verified READY-time rewards inside that share.
-4. Recycle stale or empty compute allocation instead of paying unverifiable work.
+4. Recycle stale, malformed or empty compute allocation instead of paying unverifiable work or releasing the reserved compute slice.
 
 Deregistered or replaced hotkeys receive nothing because UID mapping happens at weight time.
 The validator installs each finalized allocation without an additional score EMA. This preserves the target-price compute percentage and prevents departed or quarantined GPUs from retaining historical payout weight.

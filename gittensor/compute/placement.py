@@ -88,13 +88,15 @@ class GlobalGepetto:
         assignments: dict[str, str] = {}
         remaining = dict(quotas)
 
-        # Locked assignments remain in place until minimum residency expires.
+        # Keep a resident assignment only while it still fits the desired map.
+        # Excess resident GPUs remain candidates so missing minimum replicas can
+        # preempt residency through _switch_allowed below.
         for gpu in gpu_list:
             current = gpu.registration.release_digest
             locked = now - gpu.assignment_started_at < self.minimum_residency_seconds
-            if locked and current in remaining:
+            if locked and remaining.get(current, 0) > 0:
                 assignments[gpu.registration.gpu_id] = current
-                remaining[current] = max(0, remaining[current] - 1)
+                remaining[current] -= 1
 
         # Keep existing assignments where they still fit the desired map.
         for gpu in gpu_list:
@@ -207,6 +209,8 @@ class GlobalGepetto:
             return True, ''
         if minimum_missing:
             return True, ''
+        if now - gpu.assignment_started_at < self.minimum_residency_seconds:
+            return False, 'current assignment has not completed minimum residency'
         if shortage <= self.minimum_switch_gain_gpu:
             return False, 'placement gain is inside the hysteresis band'
         shortage_since = self._shortage_since.get(target.release_digest, now)
