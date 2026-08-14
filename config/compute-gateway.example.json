@@ -1,0 +1,18 @@
+{
+  "control_plane_url": "https://compute-control.gittensor.ai",
+  "control_plane_token_env": "GITTENSOR_GATEWAY_CONTROL_TOKEN",
+  "gateway_token_env": "GITTENSOR_GATEWAY_TOKEN",
+  "region": "us-central",
+  "request_timeout_seconds": 900,
+  "control_timeout_seconds": 10,
+  "catalog_ttl_seconds": 30,
+  "estimated_tokens_per_second": 20,
+  "estimated_fixed_seconds": 0.25,
+  "max_request_bytes": 8388608,
+  "max_response_bytes": 33554432,
+  "max_stream_line_bytes": 1048576,
+  "reservation_renew_interval_seconds": 30,
+  "rtt_probe_ttl_seconds": 30,
+  "rtt_probe_timeout_seconds": 3,
+  "require_stream_proof": true
+}

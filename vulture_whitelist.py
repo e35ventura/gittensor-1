@@ -43,3 +43,38 @@ _.get_help  # unused method (gittensor/cli/issue_commands/help.py:125)
 _.ttl_get_block  # unused method (gittensor/utils/misc.py:91)
 _.get_help  # unused method (gittensor/cli/issue_commands/help.py:180)
 add_validator_args  # unused function (gittensor/utils/config.py:81)
+
+# Compute control-plane fields serialized through dataclasses / HTTP JSON.
+ready_gpus
+registered_gpus
+hardware_type
+hardware_uuid
+from_release
+to_release
+states
+expected_completion_seconds
+effective_ready_gpus
+unspent_budget
+evidence_digest
+price_block
+_.row_factory
+StaticIdentityResolver
+_.sock
+RuntimeStreamSigner
+__getattr__
+control_plane_main
+miner_main
+gateway_main
+runtime_proxy_main
+failobj
+file_pointer
+new_url
+
+# BaseHTTPRequestHandler discovers these names dynamically.
+_.server_version
+_.do_GET
+_.do_POST
+_.close_connection
+
+# urllib's opener discovers redirect handlers dynamically.
+_.redirect_request

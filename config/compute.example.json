@@ -1,0 +1,94 @@
+{
+  "fleet": {
+    "floor": 4,
+    "initial_target": 4,
+    "certified_slots_per_gpu": 4,
+    "target_price_per_gpu_hour": 0.65,
+    "target_price_currency": "USD",
+    "subnet_miner_emission_value_per_hour": 26.0,
+    "max_budget_per_hour": null,
+    "max_compute_emission_share": 0.5
+  },
+  "emission_oracle": {
+    "enabled": true,
+    "refresh_interval_seconds": 60,
+    "max_refresh_staleness_seconds": 300,
+    "max_epoch_age_seconds": 9000,
+    "request_timeout_seconds": 5,
+    "tao_usd_price_sources": ["coinbase", "coingecko"],
+    "minimum_price_sources": 2,
+    "maximum_price_divergence": 0.05
+  },
+  "autoscaling": {
+    "ewma_alpha": 0.3,
+    "utilization_up": 0.75,
+    "utilization_down": 0.35,
+    "sustain_up_seconds": 120,
+    "sustain_down_seconds": 900,
+    "cooldown_seconds": 900
+  },
+  "verification": {
+    "status_url": "http://127.0.0.1:9090/api/status",
+    "timeout_seconds": 5,
+    "lease_ttl_seconds": 90,
+    "expected_hardware": "RTX 5090",
+    "require_model_canary": true,
+    "bearer_token_env": null,
+    "source_repository": "https://github.com/gittensor-ai-lab/sparkcompute",
+    "source_commit": "aa61fbc20d24c217ea9f33e20be67d75a388e45d",
+    "expected_verifier_protocol": "sparkcompute-v1",
+    "expected_verifier_measurement": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "require_verifier_measurement": true,
+    "require_status_signature": true,
+    "trusted_verifier_public_keys": [],
+    "require_runtime_attestation": true,
+    "require_stream_proof": true,
+    "require_confidential_compute": false,
+    "require_uniqueness_challenge": true,
+    "uniqueness_challenge_ttl_seconds": 900,
+    "uniqueness_batch_size": 3,
+    "require_weight_challenges": true,
+    "weight_challenge_interval_seconds": 30,
+    "weight_challenge_ttl_seconds": 30,
+    "weight_verification_ttl_seconds": 900,
+    "challenge_sample_size": 3,
+    "require_signed_containers": true,
+    "cosign_binary": "cosign",
+    "cosign_public_key_path": "config/gittensor-runtime-cosign.pub",
+    "status_urls": [],
+    "refresh_workers": 32
+  },
+  "router": {
+    "reservation_ttl_seconds": 180,
+    "default_rtt_ms": 50,
+    "equivalent_finish_epsilon_seconds": 0.025,
+    "telemetry_ttl_seconds": 30,
+    "maximum_service_seconds": 900,
+    "failure_quarantine_threshold": 3
+  },
+  "placement": {
+    "minimum_residency_seconds": 900,
+    "control_interval_seconds": 60
+  },
+  "state": {
+    "database_path": "var/gittensor-compute.sqlite3"
+  },
+  "identity": {
+    "netuid": 74,
+    "network": "finney",
+    "signature_ttl_seconds": 60,
+    "metagraph_refresh_seconds": 60,
+    "spark_node_owners_path": "config/spark-node-owners.json"
+  },
+  "assignment": {
+    "request_timeout_seconds": 15,
+    "redispatch_interval_seconds": 60,
+    "validator_wallet_name": "default",
+    "validator_wallet_hotkey": "default",
+    "validator_wallet_path": null
+  },
+  "control_loop": {
+    "verification_interval_seconds": 30,
+    "settlement_interval_seconds": 3600
+  }
+}

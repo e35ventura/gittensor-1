@@ -1,0 +1,31 @@
+name: Compute sub-subnet
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'codex/**'
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install 3.12
+      - run: uv sync --extra dev
+      - name: Lint compute integration
+        run: uv run ruff check gittensor/compute gittensor/validator/compute_rewards.py gittensor/validator/emission_allocation.py gittensor/validator/forward.py neurons/base/validator.py tests/compute tests/validator/test_compute_rewards.py tests/validator/test_forward_compute_allocation.py tests/validator/test_blend_emission_pools.py
+      - name: Type-check repository
+        run: uv run pyright
+      - name: Check dead code
+        run: uv run vulture
+      - name: Test compute integration
+        run: uv run pytest tests/compute tests/validator/test_compute_rewards.py tests/validator/test_forward_compute_allocation.py tests/validator/test_blend_emission_pools.py -q
+      - name: Build and smoke-test all compute CLIs
+        run: |
+          uv build
+          uv run gitt-compute --help
+          uv run gitt-compute-miner --help
+          uv run gitt-compute-gateway --help
+          uv run gitt-compute-runtime-proxy --help
