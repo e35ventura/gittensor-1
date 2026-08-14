@@ -31,6 +31,8 @@ class FleetConfig:
     max_budget_per_hour: float | None = None
     max_compute_emission_share: float = 0.50
     target_price_currency: str = 'USD'
+    scarcity_reward_exponent: float = 0.5
+    scarcity_multiplier_cap: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,9 @@ class RouterConfig:
 class PlacementConfig:
     minimum_residency_seconds: float
     control_interval_seconds: float
+    switch_sustain_seconds: float = 120.0
+    planning_horizon_seconds: float = 900.0
+    minimum_switch_gain_gpu: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -185,6 +190,8 @@ class ComputeConfig:
             fleet.target_price_per_gpu_hour,
             fleet.subnet_miner_emission_value_per_hour,
             fleet.max_compute_emission_share,
+            fleet.scarcity_reward_exponent,
+            fleet.scarcity_multiplier_cap,
             scaling.ewma_alpha,
             scaling.utilization_up,
             scaling.utilization_down,
@@ -204,6 +211,9 @@ class ComputeConfig:
             self.router.maximum_service_seconds,
             self.placement.minimum_residency_seconds,
             self.placement.control_interval_seconds,
+            self.placement.switch_sustain_seconds,
+            self.placement.planning_horizon_seconds,
+            self.placement.minimum_switch_gain_gpu,
             self.identity.signature_ttl_seconds,
             self.identity.metagraph_refresh_seconds,
             self.assignment.request_timeout_seconds,
@@ -247,6 +257,10 @@ class ComputeConfig:
             raise ValueError('fleet.subnet_miner_emission_value_per_hour must be positive')
         if not 0 < fleet.max_compute_emission_share <= 0.90:
             raise ValueError('fleet.max_compute_emission_share must be in (0, 0.90]')
+        if not 0 < fleet.scarcity_reward_exponent < 1:
+            raise ValueError('fleet.scarcity_reward_exponent must be in (0, 1)')
+        if fleet.scarcity_multiplier_cap < 1:
+            raise ValueError('fleet.scarcity_multiplier_cap must be at least 1')
         minimum_budget = fleet.floor * fleet.target_price_per_gpu_hour
         if fleet.max_budget_per_hour is not None and fleet.max_budget_per_hour < minimum_budget:
             raise ValueError('fleet.max_budget_per_hour must fund the configured floor')
@@ -262,6 +276,7 @@ class ComputeConfig:
                 self.verification.lease_ttl_seconds,
                 self.router.reservation_ttl_seconds,
                 self.placement.control_interval_seconds,
+                self.placement.planning_horizon_seconds,
                 self.verification.weight_challenge_interval_seconds,
                 self.verification.weight_challenge_ttl_seconds,
                 self.verification.weight_verification_ttl_seconds,
@@ -282,6 +297,10 @@ class ComputeConfig:
             <= 0
         ):
             raise ValueError('all intervals and TTLs must be positive')
+        if self.placement.minimum_residency_seconds < 0 or self.placement.switch_sustain_seconds < 0:
+            raise ValueError('placement residency and sustain periods cannot be negative')
+        if self.placement.minimum_switch_gain_gpu < 0:
+            raise ValueError('placement.minimum_switch_gain_gpu cannot be negative')
         if self.router.equivalent_finish_epsilon_seconds < 0:
             raise ValueError('router.equivalent_finish_epsilon_seconds cannot be negative')
         if self.router.maximum_service_seconds < self.router.reservation_ttl_seconds:

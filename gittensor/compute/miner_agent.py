@@ -26,10 +26,11 @@ from gittensor.compute.auth import (
     ValidatorCommandAuthenticator,
 )
 from gittensor.compute.http_json import load_json_object, read_json_object
-from gittensor.compute.inference_tokens import verify_inference_capability
+from gittensor.compute.inference_tokens import InferenceCapability, verify_inference_capability
 from gittensor.compute.inference_verification import canonical_request_digest
 from gittensor.compute.miner_runtime import ContainerRuntimeConfig, ContainerRuntimeManager, RuntimeManager
 from gittensor.compute.models import AssignmentCommand, GPUState, RuntimeEvidence
+from gittensor.compute.request_capacity import estimate_request_capacity
 from gittensor.compute.safe_http import no_redirect_urlopen, validate_https_or_loopback_origin
 
 _MAX_CONTROL_RESPONSE_BYTES = 64 * 1024
@@ -246,6 +247,7 @@ class MinerRuntimeAgent:
         self._revocation_worker: threading.Thread | None = None
         self._accepting_inference = False
         self._active_inference = 0
+        self._active_kv_bytes = 0
         self._revoked_epoch = 0
         self._revocation_draining = False
         self._drained = threading.Condition(self._lock)
@@ -261,7 +263,7 @@ class MinerRuntimeAgent:
     def authenticate(self, method: str, path: str, payload: Mapping[str, Any], headers: Mapping[str, str]) -> None:
         self.authenticator.authenticate(method, path, payload, headers)
 
-    def authenticate_inference(self, authorization: str) -> None:
+    def authenticate_inference(self, authorization: str) -> InferenceCapability:
         with self._lock:
             command = self._command
             if command is None or command.epoch <= self._revoked_epoch or not authorization.startswith('Bearer '):
@@ -277,6 +279,7 @@ class MinerRuntimeAgent:
             nonce_key = f'inference:{command.gpu_id}:{command.epoch}'
             if not self.store.consume_nonce(nonce_key, capability.reservation_id, capability.expires_at):
                 raise AuthenticationError('inference token has already been used')
+            return capability
 
     def accept_assignment(self, command: AssignmentCommand) -> None:
         if command.gpu_id != self.config.gpu_id:
@@ -405,9 +408,10 @@ class MinerRuntimeAgent:
                 'last_error': self._last_error,
                 'accepting_inference': self._accepting_inference,
                 'active_inference': self._active_inference,
+                'active_kv_bytes': self._active_kv_bytes,
             }
 
-    def open_inference(self, payload: Mapping[str, Any]) -> Any:
+    def open_inference(self, payload: Mapping[str, Any], capability: InferenceCapability) -> Any:
         with self._lock:
             command = self._command
             if (
@@ -419,6 +423,10 @@ class MinerRuntimeAgent:
                 raise ValueError('runtime is not accepting inference')
             if self._active_inference >= command.certified_slots:
                 raise InferenceCapacityUnavailable('runtime certified concurrency is full')
+            if capability.gpu_id != command.gpu_id or capability.release_digest != command.release_digest:
+                raise AuthenticationError('inference capability does not match the active assignment')
+            if self._active_kv_bytes + capability.reserved_kv_bytes > command.kv_cache_capacity_bytes:
+                raise InferenceCapacityUnavailable('runtime certified KV-cache capacity is full')
             if payload.get('release_digest') != command.release_digest:
                 raise ValueError('inference request does not match the active release')
             request_payload = payload.get('openai_request')
@@ -426,6 +434,17 @@ class MinerRuntimeAgent:
                 raise ValueError('inference request must contain an openai_request object')
             if request_payload.get('model') != command.model_id:
                 raise ValueError('inference request does not target the assigned model')
+            try:
+                request_capacity = estimate_request_capacity(
+                    request_payload,
+                    request_overhead_tokens=command.request_overhead_tokens,
+                    max_context_tokens=command.max_context_tokens,
+                )
+            except ValueError as exc:
+                raise ValueError(f'inference request capacity is invalid: {exc}') from exc
+            required_kv_bytes = request_capacity.context_tokens * command.kv_bytes_per_token
+            if required_kv_bytes > capability.reserved_kv_bytes:
+                raise AuthenticationError('inference request exceeds its signed KV reservation')
             created = int(payload.get('created') or 0)
             if created <= 0:
                 raise ValueError('inference request must contain a positive created timestamp')
@@ -433,6 +452,7 @@ class MinerRuntimeAgent:
             if not stream_public_key:
                 raise ValueError('runtime stream signing key is unavailable')
             self._active_inference += 1
+            self._active_kv_bytes += capability.reserved_kv_bytes
             request_digest = canonical_request_digest(request_payload)
         try:
             request = urllib.request.Request(
@@ -459,12 +479,13 @@ class MinerRuntimeAgent:
                 response.close()
                 raise
         except Exception:
-            self.close_inference()
+            self.close_inference(capability.reserved_kv_bytes)
             raise
 
-    def close_inference(self) -> None:
+    def close_inference(self, reserved_kv_bytes: int) -> None:
         with self._lock:
             self._active_inference = max(0, self._active_inference - 1)
+            self._active_kv_bytes = max(0, self._active_kv_bytes - max(0, reserved_kv_bytes))
             if self._active_inference == 0:
                 self._drained.notify_all()
 
@@ -599,8 +620,9 @@ def make_handler(agent: MinerRuntimeAgent) -> type[BaseHTTPRequestHandler]:
             try:
                 payload = self._read_json()
                 headers = {key: value for key, value in self.headers.items()}
+                capability: InferenceCapability | None = None
                 if self.path == '/v1/gittensor/inference':
-                    agent.authenticate_inference(self.headers.get('Authorization', ''))
+                    capability = agent.authenticate_inference(self.headers.get('Authorization', ''))
                 else:
                     agent.authenticate('POST', self.path, payload, headers)
                 if self.path == '/v1/gittensor/assignments':
@@ -620,7 +642,8 @@ def make_handler(agent: MinerRuntimeAgent) -> type[BaseHTTPRequestHandler]:
                     self._send(HTTPStatus.OK, {'sha256': digest})
                     return
                 if self.path == '/v1/gittensor/inference':
-                    self._proxy_inference(payload)
+                    assert capability is not None
+                    self._proxy_inference(payload, capability)
                     return
                 self._send(HTTPStatus.NOT_FOUND, {'error': 'not_found'})
             except AuthenticationError as exc:
@@ -643,8 +666,8 @@ def make_handler(agent: MinerRuntimeAgent) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
-        def _proxy_inference(self, payload: Mapping[str, Any]) -> None:
-            response = agent.open_inference(payload)
+        def _proxy_inference(self, payload: Mapping[str, Any], capability: InferenceCapability) -> None:
+            response = agent.open_inference(payload, capability)
             try:
                 self.send_response(response.status)
                 self.send_header('Content-Type', response.headers.get('Content-Type', 'application/json'))
@@ -655,7 +678,7 @@ def make_handler(agent: MinerRuntimeAgent) -> type[BaseHTTPRequestHandler]:
                     self.wfile.flush()
             finally:
                 response.close()
-                agent.close_inference()
+                agent.close_inference(capability.reserved_kv_bytes)
 
         def log_message(self, format: str, *args: object) -> None:
             return

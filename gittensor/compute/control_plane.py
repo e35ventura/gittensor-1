@@ -79,14 +79,19 @@ class ComputeControlPlane:
         self.autoscaler = FleetAutoscaler(
             config.autoscaling,
             floor=config.fleet.floor,
-            certified_slots_per_gpu=config.fleet.certified_slots_per_gpu,
             initial_target=config.fleet.initial_target,
         )
         self.router = FastestFinishRouter(
             config.router.reservation_ttl_seconds,
             config.router.equivalent_finish_epsilon_seconds,
         )
-        self.gepetto = GlobalGepetto(config.placement.minimum_residency_seconds)
+        self.gepetto = GlobalGepetto(
+            config.placement.minimum_residency_seconds,
+            switch_sustain_seconds=config.placement.switch_sustain_seconds,
+            planning_horizon_seconds=config.placement.planning_horizon_seconds,
+            minimum_switch_gain_gpu=config.placement.minimum_switch_gain_gpu,
+            target_utilization=config.autoscaling.utilization_up,
+        )
         self.store = store
         self.router.attach_store(store)
         self.assignment_executor = assignment_executor
@@ -100,6 +105,7 @@ class ComputeControlPlane:
         self.emission_oracle_observation: EmissionObservation | None = None
         self.emission_oracle_error: str | None = None
         self.funding = self._funding_plan()
+        self.last_autoscale: AutoscaleDecision | None = None
         self.placement = PlacementPlan({}, {}, ())
         now = self.clock()
         self._last_tick_at = now
@@ -111,8 +117,8 @@ class ComputeControlPlane:
         self._ready_seconds: dict[str, float] = {}
         self._accepted: dict[str, int] = {}
         self._rejected: dict[str, int] = {}
-        self._rejected_service_seconds: dict[str, float] = {}
-        self._completed_slot_seconds: dict[str, float] = {}
+        self._rejected_capacity_seconds: dict[str, float] = {}
+        self._completed_capacity_seconds: dict[str, float] = {}
         self._pending_reservation_deletions: set[str] = set()
         self._pending_expired_reservation_deletions: set[str] = set()
         self._lock = threading.RLock()
@@ -121,6 +127,8 @@ class ComputeControlPlane:
 
     def register_release(self, release: Release) -> None:
         with self._lock:
+            if release.max_concurrency > self.config.fleet.certified_slots_per_gpu:
+                raise ValueError('release max_concurrency exceeds the operator-certified hardware ceiling')
             existing = self.releases.get(release.release_digest)
             if existing is not None and existing != release:
                 raise ValueError('an approved release digest is immutable')
@@ -137,6 +145,11 @@ class ComputeControlPlane:
                     'model_id': release.model_id,
                     'model_revision': release.model_revision,
                     'token_proof_scheme': release.token_proof_scheme,
+                    'max_concurrency': release.max_concurrency,
+                    'max_context_tokens': release.max_context_tokens,
+                    'kv_bytes_per_token': release.kv_bytes_per_token,
+                    'kv_cache_capacity_bytes': release.kv_cache_capacity_bytes,
+                    'request_overhead_tokens': release.request_overhead_tokens,
                 }
                 for release in sorted(self.releases.values(), key=lambda item: (item.model_id, item.release_digest))
             ]
@@ -279,6 +292,8 @@ class ComputeControlPlane:
                 },
                 {digest: count for digest, count in self.placement.replica_counts.items() if digest != release_digest},
                 (),
+                {digest: value for digest, value in self.placement.shortages.items() if digest != release_digest},
+                {digest: value for digest, value in self.placement.deferred.items() if digest != release_digest},
             )
             self._persist()
         errors = []
@@ -585,6 +600,8 @@ class ComputeControlPlane:
         release_digest: str,
         requester_region: str,
         expected_service_seconds: float,
+        estimated_input_tokens: int = 1,
+        max_output_tokens: int = 1,
         now: float | None = None,
     ) -> RouteDecision:
         timestamp = self.clock() if now is None else now
@@ -594,9 +611,26 @@ class ComputeControlPlane:
             or expected_service_seconds > self.config.router.maximum_service_seconds
         ):
             raise ValueError('expected_service_seconds must be positive and within the configured maximum')
-        if release_digest not in self.releases:
-            raise CapacityUnavailable('requested release is not approved')
+        for field_name, value in {
+            'estimated_input_tokens': estimated_input_tokens,
+            'max_output_tokens': max_output_tokens,
+        }.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f'{field_name} must be a positive integer')
         with self._lock:
+            release = self.releases.get(release_digest)
+            if release is None:
+                raise CapacityUnavailable('requested release is not approved')
+            context_tokens = estimated_input_tokens + max_output_tokens
+            if context_tokens > release.max_context_tokens:
+                raise ValueError('request exceeds the approved release context limit')
+            request_kv_bytes = context_tokens * release.kv_bytes_per_token
+            if request_kv_bytes > release.kv_cache_capacity_bytes:
+                raise ValueError('request exceeds the approved release KV-cache capacity')
+            request_capacity_units = max(
+                1.0 / release.max_concurrency,
+                request_kv_bytes / release.kv_cache_capacity_bytes,
+            )
             self._account_ready_seconds(timestamp)
             self._expire_leases(timestamp)
             candidates = [
@@ -605,7 +639,7 @@ class ComputeControlPlane:
                     endpoint=record.registration.endpoint,
                     release_digest=record.registration.release_digest,
                     performance_class=record.registration.performance_class,
-                    certified_slots=record.registration.certified_slots,
+                    certified_slots=release.max_concurrency,
                     observed_active_slots=(
                         record.gateway_active_slots
                         if timestamp - record.gateway_telemetry_updated_at < self.config.router.telemetry_ttl_seconds
@@ -629,16 +663,33 @@ class ComputeControlPlane:
                     ),
                     stream_public_key=record.lease.stream_public_key if record.lease else '',
                     eligible_until=record.lease.expires_at if record.lease else timestamp,
+                    kv_cache_capacity_bytes=release.kv_cache_capacity_bytes,
                 )
                 for record in self.gpus.values()
                 if record.is_ready(timestamp) and record.registration.release_digest == release_digest
             ]
             try:
-                decision = self.router.route(candidates, release_digest, timestamp)
+                decision = self.router.route(
+                    candidates,
+                    release_digest,
+                    timestamp,
+                    request_kv_bytes=request_kv_bytes,
+                    request_capacity_units=request_capacity_units,
+                )
             except CapacityUnavailable:
-                self._record_demand(release_digest, expected_service_seconds, rejected=True)
+                self._record_demand(
+                    release_digest,
+                    expected_service_seconds,
+                    request_capacity_units,
+                    rejected=True,
+                )
                 raise
-            self._record_demand(release_digest, expected_service_seconds, rejected=False)
+            self._record_demand(
+                release_digest,
+                expected_service_seconds,
+                request_capacity_units,
+                rejected=False,
+            )
             selected = self.gpus[decision.gpu_id]
             assert selected.lease is not None
             capability = issue_inference_capability(
@@ -647,6 +698,7 @@ class ComputeControlPlane:
                 gpu_id=decision.gpu_id,
                 release_digest=release_digest,
                 expires_at=min(decision.expires_at, selected.lease.expires_at),
+                reserved_kv_bytes=decision.reserved_kv_bytes,
             )
             return replace(decision, inference_token=capability)
 
@@ -660,10 +712,10 @@ class ComputeControlPlane:
                     0.0,
                     min(timestamp, reservation.expires_at) - max(reservation.created_at, self._last_tick_at),
                 )
-                previous_completed_seconds = self._completed_slot_seconds.get(reservation.release_digest)
-                self._completed_slot_seconds[reservation.release_digest] = (
+                previous_completed_seconds = self._completed_capacity_seconds.get(reservation.release_digest)
+                self._completed_capacity_seconds[reservation.release_digest] = (
                     previous_completed_seconds or 0.0
-                ) + occupied_seconds
+                ) + occupied_seconds * reservation.capacity_units
             if self.store is not None:
                 pending = set(self._pending_reservation_deletions)
                 expired = set(self._pending_expired_reservation_deletions)
@@ -678,9 +730,9 @@ class ComputeControlPlane:
                     if reservation is not None:
                         self.router.reattach(reservation)
                         if previous_completed_seconds is None:
-                            self._completed_slot_seconds.pop(reservation.release_digest, None)
+                            self._completed_capacity_seconds.pop(reservation.release_digest, None)
                         else:
-                            self._completed_slot_seconds[reservation.release_digest] = previous_completed_seconds
+                            self._completed_capacity_seconds[reservation.release_digest] = previous_completed_seconds
                     raise
                 self._pending_reservation_deletions.difference_update(pending)
                 self._pending_expired_reservation_deletions.difference_update(expired)
@@ -694,8 +746,9 @@ class ComputeControlPlane:
                 0.0,
                 min(now, reservation.expires_at) - max(reservation.created_at, self._last_tick_at),
             )
-            self._completed_slot_seconds[reservation.release_digest] = (
-                self._completed_slot_seconds.get(reservation.release_digest, 0.0) + occupied_seconds
+            self._completed_capacity_seconds[reservation.release_digest] = (
+                self._completed_capacity_seconds.get(reservation.release_digest, 0.0)
+                + occupied_seconds * reservation.capacity_units
             )
 
     def _remove_from_placement(self, gpu_id: str) -> None:
@@ -704,7 +757,13 @@ class ComputeControlPlane:
         replica_counts = dict(self.placement.replica_counts)
         if release_digest is not None:
             replica_counts[release_digest] = max(0, replica_counts.get(release_digest, 1) - 1)
-        self.placement = PlacementPlan(assignments, replica_counts, ())
+        self.placement = PlacementPlan(
+            assignments,
+            replica_counts,
+            (),
+            dict(self.placement.shortages),
+            dict(self.placement.deferred),
+        )
 
     def _dispatch_assignment_revocation(self, record: GPURecord, epoch: int, reason: str) -> bool:
         if self.assignment_executor is None:
@@ -810,7 +869,8 @@ class ComputeControlPlane:
                 observation.observed_active_slots, bool
             ):
                 raise ValueError('observed_active_slots must be an integer')
-            if not 0 <= observation.observed_active_slots <= record.registration.certified_slots:
+            release = self.releases[release_digest]
+            if not 0 <= observation.observed_active_slots <= release.max_concurrency:
                 raise ValueError('observed_active_slots exceeds the certified concurrency')
             alpha = 0.2
             if observation.measured_rtt_ms > 0:
@@ -937,43 +997,45 @@ class ComputeControlPlane:
                     0.0,
                     occupied_until - max(reservation.created_at, self._last_tick_at),
                 )
-                self._completed_slot_seconds[reservation.release_digest] = (
-                    self._completed_slot_seconds.get(reservation.release_digest, 0.0) + occupied_seconds
+                self._completed_capacity_seconds[reservation.release_digest] = (
+                    self._completed_capacity_seconds.get(reservation.release_digest, 0.0)
+                    + occupied_seconds * reservation.capacity_units
                 )
-            active_counts = self.router.active_counts(timestamp)
-            active_release_counts = self.router.active_release_counts(timestamp)
+            active_capacity = self.router.active_capacity_by_release(timestamp)
             active_reservations = self.router.active_reservations(timestamp)
-            live_concurrent = float(sum(active_counts.values()))
-            active_slot_seconds: dict[str, float] = {}
+            live_gpu_equivalents = sum(active_capacity.values())
+            active_capacity_seconds: dict[str, float] = {}
             for reservation in active_reservations:
                 occupied_seconds = max(0.0, timestamp - max(reservation.created_at, self._last_tick_at))
-                active_slot_seconds[reservation.release_digest] = (
-                    active_slot_seconds.get(reservation.release_digest, 0.0) + occupied_seconds
+                active_capacity_seconds[reservation.release_digest] = (
+                    active_capacity_seconds.get(reservation.release_digest, 0.0)
+                    + occupied_seconds * reservation.capacity_units
                 )
-            window_concurrent = (
-                sum(self._completed_slot_seconds.values()) + sum(active_slot_seconds.values())
+            window_gpu_equivalents = (
+                sum(self._completed_capacity_seconds.values()) + sum(active_capacity_seconds.values())
             ) / elapsed
-            observed_concurrent = max(live_concurrent, window_concurrent)
-            rejected_concurrent = sum(self._rejected_service_seconds.values()) / elapsed
+            observed_gpu_equivalents = max(live_gpu_equivalents, window_gpu_equivalents)
+            rejected_gpu_equivalents = sum(self._rejected_capacity_seconds.values()) / elapsed
             autoscaling = self.autoscaler.update(
-                active_slots=observed_concurrent,
-                rejected_concurrent_demand=rejected_concurrent,
+                active_gpu_equivalents=observed_gpu_equivalents,
+                rejected_gpu_equivalents=rejected_gpu_equivalents,
                 funded_target=self.funding.funded_target,
                 now=timestamp,
             )
+            self.last_autoscale = autoscaling
             self.funding = self._funding_plan(timestamp)
             release_demand = [
                 ReleaseDemand(
                     release_digest=release_digest,
-                    concurrent_demand=max(
-                        float(active_release_counts.get(release_digest, 0)),
+                    gpu_equivalent_demand=max(
+                        active_capacity.get(release_digest, 0.0),
                         (
-                            self._completed_slot_seconds.get(release_digest, 0.0)
-                            + active_slot_seconds.get(release_digest, 0.0)
+                            self._completed_capacity_seconds.get(release_digest, 0.0)
+                            + active_capacity_seconds.get(release_digest, 0.0)
                         )
                         / elapsed,
                     )
-                    + self._rejected_service_seconds.get(release_digest, 0.0) / elapsed,
+                    + self._rejected_capacity_seconds.get(release_digest, 0.0) / elapsed,
                 )
                 for release_digest in self.releases
             ]
@@ -1001,12 +1063,14 @@ class ComputeControlPlane:
                     dict(self.placement.assignments),
                     dict(self.placement.replica_counts),
                     (),
+                    dict(self.placement.shortages),
+                    dict(self.placement.deferred),
                 )
             ready = [record for record in self.gpus.values() if record.is_ready(timestamp)]
             self._accepted.clear()
             self._rejected.clear()
-            self._rejected_service_seconds.clear()
-            self._completed_slot_seconds.clear()
+            self._rejected_capacity_seconds.clear()
+            self._completed_capacity_seconds.clear()
             self._last_tick_at = timestamp
             self._persist()
             result = ControlTick(
@@ -1026,7 +1090,9 @@ class ComputeControlPlane:
         checkpoint = (
             deepcopy(self.gpus),
             deepcopy(self.autoscaler),
+            deepcopy(self.gepetto),
             self.funding,
+            self.last_autoscale,
             self.placement,
             self._last_tick_at,
             self._last_ready_account_at,
@@ -1036,8 +1102,8 @@ class ComputeControlPlane:
             dict(self._ready_seconds),
             dict(self._accepted),
             dict(self._rejected),
-            dict(self._rejected_service_seconds),
-            dict(self._completed_slot_seconds),
+            dict(self._rejected_capacity_seconds),
+            dict(self._completed_capacity_seconds),
             set(self._pending_reservation_deletions),
             set(self._pending_expired_reservation_deletions),
             self.router.checkpoint(),
@@ -1048,7 +1114,9 @@ class ComputeControlPlane:
             (
                 self.gpus,
                 self.autoscaler,
+                self.gepetto,
                 self.funding,
+                self.last_autoscale,
                 self.placement,
                 self._last_tick_at,
                 self._last_ready_account_at,
@@ -1058,8 +1126,8 @@ class ComputeControlPlane:
                 self._ready_seconds,
                 self._accepted,
                 self._rejected,
-                self._rejected_service_seconds,
-                self._completed_slot_seconds,
+                self._rejected_capacity_seconds,
+                self._completed_capacity_seconds,
                 self._pending_reservation_deletions,
                 self._pending_expired_reservation_deletions,
                 routing_checkpoint,
@@ -1117,7 +1185,11 @@ class ComputeControlPlane:
                 filesystem_digest=release.filesystem_digest,
                 weight_files=release.weight_files,
                 token_proof_scheme=release.token_proof_scheme,
-                certified_slots=record.registration.certified_slots,
+                certified_slots=release.max_concurrency,
+                max_context_tokens=release.max_context_tokens,
+                kv_cache_capacity_bytes=release.kv_cache_capacity_bytes,
+                kv_bytes_per_token=release.kv_bytes_per_token,
+                request_overhead_tokens=release.request_overhead_tokens,
                 assignment_token=record.assignment_token,
             )
             record.assignment_last_dispatched_at = now
@@ -1174,13 +1246,17 @@ class ComputeControlPlane:
             if window_seconds <= 0:
                 raise ValueError('settlement timestamp must advance the current window')
             window_budget = Decimal(str(self._funded_budget_seconds)) / Decimal(3600)
-            compute_emission_share = self._compute_emission_share_seconds / window_seconds
+            reserved_compute_emission_share = self._compute_emission_share_seconds / window_seconds
             result = settle_ready_seconds(
                 self.funding,
                 window_seconds,
                 self._ready_seconds,
                 window_budget_override=window_budget,
+                scarcity_reward_exponent=self.config.fleet.scarcity_reward_exponent,
+                scarcity_multiplier_cap=self.config.fleet.scarcity_multiplier_cap,
             )
+            paid_ratio = float(result.distributed_budget / result.window_budget) if result.window_budget > 0 else 0.0
+            paid_compute_emission_share = reserved_compute_emission_share * paid_ratio
             miner_rewards = aggregate_miner_rewards(
                 result,
                 {gpu_id: record.registration.miner_uid for gpu_id, record in self.gpus.items()},
@@ -1206,9 +1282,14 @@ class ComputeControlPlane:
                     hotkey_reward_payload = {hotkey: str(amount) for hotkey, amount in hotkey_rewards.items()}
                     settlement_metadata: dict[str, Any] = {
                         'window_budget': str(result.window_budget),
+                        'distributed_budget': str(result.distributed_budget),
+                        'unspent_budget': str(result.unspent_budget),
                         'total_ready_seconds': result.total_ready_seconds,
                         'effective_ready_gpus': result.effective_ready_gpus,
-                        'compute_emission_share': compute_emission_share,
+                        'effective_funded_gpus': result.effective_funded_gpus,
+                        'scarcity_multiplier': result.scarcity_multiplier,
+                        'compute_emission_share': paid_compute_emission_share,
+                        'compute_reserved_emission_share': reserved_compute_emission_share,
                         'target_price_currency': self.config.fleet.target_price_currency,
                         'subnet_miner_emission_value_per_hour': str(self.subnet_miner_emission_value_per_hour),
                         'emission_epoch_block': (
@@ -1291,7 +1372,16 @@ class ComputeControlPlane:
                 },
                 'registered_gpus': len(self.gpus),
                 'ready_gpus': sum(record.is_ready(timestamp) for record in self.gpus.values()),
+                'supply': {
+                    'gpu_equivalent_demand': self.last_autoscale.concurrent_demand
+                    if self.last_autoscale
+                    else 0.0,
+                    'required_target': self.last_autoscale.required_target if self.last_autoscale else self.config.fleet.floor,
+                    'shortage_gpus': self.last_autoscale.supply_shortage if self.last_autoscale else 0.0,
+                },
                 'placements': dict(self.placement.assignments),
+                'placement_shortages': dict(self.placement.shortages),
+                'placement_deferred': dict(self.placement.deferred),
                 'gpus': {
                     gpu_id: {
                         'miner_uid': record.registration.miner_uid,
@@ -1341,13 +1431,20 @@ class ComputeControlPlane:
             return
         self.funding = stale_funding
 
-    def _record_demand(self, release_digest: str, service_seconds: float, *, rejected: bool) -> None:
+    def _record_demand(
+        self,
+        release_digest: str,
+        service_seconds: float,
+        capacity_units: float,
+        *,
+        rejected: bool,
+    ) -> None:
         target = self._rejected if rejected else self._accepted
         target[release_digest] = target.get(release_digest, 0) + 1
         if rejected:
-            self._rejected_service_seconds[release_digest] = self._rejected_service_seconds.get(
+            self._rejected_capacity_seconds[release_digest] = self._rejected_capacity_seconds.get(
                 release_digest, 0.0
-            ) + max(0.0, service_seconds)
+            ) + max(0.0, service_seconds) * max(0.0, capacity_units)
             self._persist()
 
     def _account_ready_seconds(self, now: float) -> None:
@@ -1427,7 +1524,7 @@ class ComputeControlPlane:
 
     def _export_state(self) -> dict[str, Any]:
         return {
-            'version': 1,
+            'version': 2,
             'releases': [asdict(value) for value in self.releases.values()],
             'gpus': [
                 {
@@ -1464,6 +1561,7 @@ class ComputeControlPlane:
                 'low_since': self.autoscaler.low_since,
                 'last_scaled_at': self.autoscaler.last_scaled_at,
             },
+            'last_autoscale': asdict(self.last_autoscale) if self.last_autoscale else None,
             'max_budget_per_hour': self.max_budget_per_hour,
             'subnet_miner_emission_value_per_hour': self.subnet_miner_emission_value_per_hour,
             'emission_oracle_observation': asdict(self.emission_oracle_observation)
@@ -1473,6 +1571,9 @@ class ComputeControlPlane:
             'placement': {
                 'assignments': dict(self.placement.assignments),
                 'replica_counts': dict(self.placement.replica_counts),
+                'shortages': dict(self.placement.shortages),
+                'deferred': dict(self.placement.deferred),
+                'shortage_since': self.gepetto.export_state(),
             },
             'last_tick_at': self._last_tick_at,
             'last_ready_account_at': self._last_ready_account_at,
@@ -1483,12 +1584,13 @@ class ComputeControlPlane:
             'ready_seconds': self._ready_seconds,
             'accepted': self._accepted,
             'rejected': self._rejected,
-            'rejected_service_seconds': self._rejected_service_seconds,
-            'completed_slot_seconds': self._completed_slot_seconds,
+            'rejected_capacity_seconds': self._rejected_capacity_seconds,
+            'completed_capacity_seconds': self._completed_capacity_seconds,
         }
 
     def _restore_state(self, state: Mapping[str, Any], now: float) -> None:
-        if int(state.get('version', 0)) != 1:
+        state_version = int(state.get('version', 0))
+        if state_version not in {1, 2}:
             raise ValueError('unsupported compute state version')
         self.releases = {value['release_digest']: Release(**value) for value in state.get('releases', [])}
         self.gpus = {}
@@ -1541,6 +1643,10 @@ class ComputeControlPlane:
         self.autoscaler.high_since = autoscaler.get('high_since')
         self.autoscaler.low_since = autoscaler.get('low_since')
         self.autoscaler.last_scaled_at = autoscaler.get('last_scaled_at')
+        saved_last_autoscale = state.get('last_autoscale')
+        self.last_autoscale = (
+            AutoscaleDecision(**saved_last_autoscale) if isinstance(saved_last_autoscale, Mapping) else None
+        )
         saved_budget = state.get('max_budget_per_hour', self.max_budget_per_hour)
         self.max_budget_per_hour = float(saved_budget) if saved_budget is not None else None
         saved_emission_value = state.get(
@@ -1577,7 +1683,10 @@ class ComputeControlPlane:
             placement.get('assignments', {}),
             placement.get('replica_counts', {}),
             (),
+            placement.get('shortages', {}),
+            placement.get('deferred', {}),
         )
+        self.gepetto.restore_state(placement.get('shortage_since', {}))
         self._last_tick_at = float(state.get('last_tick_at', now))
         self._last_ready_account_at = saved_account_at
         self._settlement_started_at = float(state.get('settlement_started_at', now))
@@ -1592,24 +1701,38 @@ class ComputeControlPlane:
         self._ready_seconds = {key: float(value) for key, value in state.get('ready_seconds', {}).items()}
         self._accepted = {key: int(value) for key, value in state.get('accepted', {}).items()}
         self._rejected = {key: int(value) for key, value in state.get('rejected', {}).items()}
-        self._rejected_service_seconds = {
-            key: float(value) for key, value in state.get('rejected_service_seconds', {}).items()
-        }
-        self._completed_slot_seconds = {
-            key: float(value) for key, value in state.get('completed_slot_seconds', {}).items()
-        }
+        if state_version == 2:
+            self._rejected_capacity_seconds = {
+                key: float(value) for key, value in state.get('rejected_capacity_seconds', {}).items()
+            }
+            self._completed_capacity_seconds = {
+                key: float(value) for key, value in state.get('completed_capacity_seconds', {}).items()
+            }
+        else:
+            self._rejected_capacity_seconds = {
+                key: float(value) / self.releases[key].max_concurrency
+                for key, value in state.get('rejected_service_seconds', {}).items()
+                if key in self.releases
+            }
+            self._completed_capacity_seconds = {
+                key: float(value) / self.releases[key].max_concurrency
+                for key, value in state.get('completed_slot_seconds', {}).items()
+                if key in self.releases
+            }
         self._account_ready_seconds(now)
         self._expire_emission_oracle(now)
         legacy_service_seconds = {key: float(value) for key, value in state.get('service_seconds_total', {}).items()}
         for release_digest, total_seconds in legacy_service_seconds.items():
+            if release_digest not in self.releases:
+                continue
             accepted = self._accepted.get(release_digest, 0)
             rejected = self._rejected.get(release_digest, 0)
             total_requests = accepted + rejected
             if total_requests <= 0:
                 continue
-            self._rejected_service_seconds.setdefault(
+            self._rejected_capacity_seconds.setdefault(
                 release_digest,
-                total_seconds * rejected / total_requests,
+                total_seconds * rejected / total_requests / self.releases[release_digest].max_concurrency,
             )
         if self.store is None:
             self.router.restore_state(state.get('reservations', []), now)

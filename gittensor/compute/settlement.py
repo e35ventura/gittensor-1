@@ -25,6 +25,9 @@ class SettlementResult:
     effective_ready_gpus: float
     gpu_rewards: Mapping[str, Decimal]
     unspent_budget: Decimal
+    distributed_budget: Decimal
+    effective_funded_gpus: float
+    scarcity_multiplier: float
 
 
 def funding_plan(
@@ -52,9 +55,15 @@ def settle_ready_seconds(
     ready_seconds_by_gpu: Mapping[str, float],
     *,
     window_budget_override: Decimal | None = None,
+    scarcity_reward_exponent: float = 0.5,
+    scarcity_multiplier_cap: float = 2.0,
 ) -> SettlementResult:
     if window_seconds <= 0:
         raise ValueError('window_seconds must be positive')
+    if not 0 < scarcity_reward_exponent < 1:
+        raise ValueError('scarcity_reward_exponent must be in (0, 1)')
+    if scarcity_multiplier_cap < 1:
+        raise ValueError('scarcity_multiplier_cap must be at least 1')
     clean_seconds = {
         gpu_id: min(window_seconds, max(0.0, float(seconds))) for gpu_id, seconds in ready_seconds_by_gpu.items()
     }
@@ -69,23 +78,45 @@ def settle_ready_seconds(
         )
     elif window_budget < 0:
         raise ValueError('window_budget_override must be non-negative')
+    window_hours = Decimal(str(window_seconds)) / Decimal(3600)
+    funded_denominator = funding.target_price_per_gpu_hour * window_hours
+    effective_funded_gpus = float(window_budget / funded_denominator) if funded_denominator > 0 else 0.0
+    effective_ready_gpus = total_ready_seconds / window_seconds
+    scarcity_multiplier = 1.0
     if total_ready_seconds == 0:
+        distributed_budget = Decimal(0)
         rewards = {gpu_id: Decimal(0) for gpu_id in clean_seconds}
         unspent = window_budget
     else:
+        if 0 < effective_ready_gpus < effective_funded_gpus:
+            scarcity_multiplier = min(
+                scarcity_multiplier_cap,
+                (effective_funded_gpus / effective_ready_gpus) ** scarcity_reward_exponent,
+            )
+        supply_value = (
+            funding.target_price_per_gpu_hour
+            * Decimal(str(effective_ready_gpus))
+            * window_hours
+            * Decimal(str(scarcity_multiplier))
+        )
+        distributed_budget = min(window_budget, supply_value)
         denominator = Decimal(str(total_ready_seconds))
         rewards = {
-            gpu_id: window_budget * Decimal(str(seconds)) / denominator for gpu_id, seconds in clean_seconds.items()
+            gpu_id: distributed_budget * Decimal(str(seconds)) / denominator
+            for gpu_id, seconds in clean_seconds.items()
         }
-        unspent = Decimal(0)
+        unspent = window_budget - distributed_budget
     return SettlementResult(
         funding=funding,
         window_seconds=window_seconds,
         window_budget=window_budget,
         total_ready_seconds=total_ready_seconds,
-        effective_ready_gpus=total_ready_seconds / window_seconds,
+        effective_ready_gpus=effective_ready_gpus,
         gpu_rewards=rewards,
         unspent_budget=unspent,
+        distributed_budget=distributed_budget,
+        effective_funded_gpus=effective_funded_gpus,
+        scarcity_multiplier=scarcity_multiplier,
     )
 
 

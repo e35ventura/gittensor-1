@@ -24,6 +24,7 @@ from gittensor.compute.inference_verification import (
     StreamProofContext,
     canonical_request_digest,
 )
+from gittensor.compute.request_capacity import estimate_request_capacity
 from gittensor.compute.safe_http import no_redirect_urlopen, public_https_request, validate_https_or_loopback_origin
 
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -95,7 +96,7 @@ class InferenceGateway:
         self.control_token = os.environ.get(config.control_plane_token_env)
         if not self.control_token:
             raise ValueError(f'{config.control_plane_token_env} must be set')
-        self._catalog: list[dict[str, str]] = []
+        self._catalog: list[dict[str, Any]] = []
         self._catalog_at = 0.0
         self._lock = threading.Lock()
         self._active_by_gpu: dict[str, int] = {}
@@ -113,13 +114,18 @@ class InferenceGateway:
         # must always receive its canonical model ID. Never let a caller choose a
         # different model inside a multi-model backend.
         runtime_request['model'] = release['model_id']
-        expected_seconds = self._estimate_service_seconds(runtime_request)
+        estimated_input_tokens, max_output_tokens, expected_seconds = self._estimate_request(
+            runtime_request,
+            release,
+        )
         route = self._control_post(
             '/v1/route',
             {
                 'release_digest': release['release_digest'],
                 'requester_region': self.config.region,
                 'expected_service_seconds': expected_seconds,
+                'estimated_input_tokens': estimated_input_tokens,
+                'max_output_tokens': max_output_tokens,
             },
         )
         stream_public_key = str(route.get('stream_public_key') or '')
@@ -289,14 +295,16 @@ class InferenceGateway:
             raise GatewayError(502, 'control plane returned an expired reservation renewal')
         return expires_at
 
-    def _resolve_release(self, model: str) -> dict[str, str]:
+    def _resolve_release(self, model: str) -> dict[str, Any]:
         now = time.monotonic()
         if now - self._catalog_at >= self.config.catalog_ttl_seconds:
             payload = self._control_get('/v1/catalog')
             releases = payload.get('releases')
             if not isinstance(releases, list):
                 raise GatewayError(502, 'control plane returned an invalid release catalog')
-            self._catalog = [{str(key): str(value) for key, value in item.items()} for item in releases]
+            if not all(isinstance(item, dict) for item in releases):
+                raise GatewayError(502, 'control plane returned an invalid release catalog')
+            self._catalog = [dict(item) for item in releases]
             self._catalog_at = now
         exact_digest = [release for release in self._catalog if release['release_digest'] == model]
         if exact_digest:
@@ -308,22 +316,41 @@ class InferenceGateway:
             raise GatewayError(409, 'model has multiple approved revisions; request its exact release digest')
         return matches[0]
 
-    def _estimate_service_seconds(self, payload: Mapping[str, Any]) -> float:
-        prompt_chars = len(json.dumps(payload.get('messages') or payload.get('prompt') or '', separators=(',', ':')))
-        prompt_tokens = max(1.0, prompt_chars / 4)
-        raw_output_tokens = payload.get('max_tokens') or payload.get('max_completion_tokens') or 256
-        if isinstance(raw_output_tokens, bool):
-            raise GatewayError(400, 'max_tokens must be a finite positive number')
+    def _estimate_request(
+        self,
+        payload: Mapping[str, Any],
+        release: Mapping[str, Any],
+    ) -> tuple[int, int, float]:
         try:
-            output_tokens = float(raw_output_tokens)
-        except (TypeError, ValueError):
-            raise GatewayError(400, 'max_tokens must be a finite positive number') from None
-        if not math.isfinite(output_tokens) or output_tokens <= 0:
-            raise GatewayError(400, 'max_tokens must be a finite positive number')
-        estimate = self.config.estimated_fixed_seconds + (prompt_tokens + output_tokens) / max(
+            request_overhead_tokens = release['request_overhead_tokens']
+            max_context_tokens = release['max_context_tokens']
+        except KeyError:
+            raise GatewayError(502, 'release catalog is missing certified context capacity') from None
+        if (
+            not isinstance(request_overhead_tokens, int)
+            or isinstance(request_overhead_tokens, bool)
+            or request_overhead_tokens < 0
+            or not isinstance(max_context_tokens, int)
+            or isinstance(max_context_tokens, bool)
+            or max_context_tokens < 1
+        ):
+            raise GatewayError(502, 'release catalog contains invalid context capacity')
+        try:
+            capacity = estimate_request_capacity(
+                payload,
+                request_overhead_tokens=request_overhead_tokens,
+                max_context_tokens=max_context_tokens,
+            )
+        except ValueError as exc:
+            raise GatewayError(400, str(exc)) from exc
+        estimate = self.config.estimated_fixed_seconds + capacity.context_tokens / max(
             0.001, self.config.estimated_tokens_per_second
         )
-        return min(estimate, self.config.request_timeout_seconds)
+        return (
+            capacity.input_tokens,
+            capacity.output_tokens,
+            min(estimate, self.config.request_timeout_seconds),
+        )
 
     def _measure_network_rtt(self, endpoint: str) -> float:
         now = time.monotonic()

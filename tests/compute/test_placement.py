@@ -47,3 +47,78 @@ def test_minimum_residency_prevents_assignment_thrashing():
     )
     assert plan.assignments == {'gpu-0': 'a'}
     assert plan.transitions == ()
+
+
+def test_demand_switch_requires_a_persisted_sustained_shortage():
+    releases = [Release('a', 'model-a', 'runtime-a'), Release('b', 'model-b', 'runtime-b')]
+    gpus = [_gpu(0, 'a'), _gpu(1, 'a')]
+    gepetto = GlobalGepetto(
+        minimum_residency_seconds=0,
+        switch_sustain_seconds=120,
+        target_utilization=0.75,
+    )
+
+    first = gepetto.plan(gpus, releases, [ReleaseDemand('b', 1)], now=100)
+
+    assert first.transitions == ()
+    assert first.deferred == {'b': 'placement shortage is not yet sustained'}
+    restored = GlobalGepetto(
+        minimum_residency_seconds=0,
+        switch_sustain_seconds=120,
+        target_utilization=0.75,
+    )
+    restored.restore_state(gepetto.export_state())
+    still_waiting = restored.plan(gpus, releases, [ReleaseDemand('b', 1)], now=219)
+    switched = restored.plan(gpus, releases, [ReleaseDemand('b', 1)], now=220)
+
+    assert still_waiting.transitions == ()
+    assert switched.transitions
+    assert all(transition.to_release == 'b' for transition in switched.transitions)
+
+
+def test_gepetto_defers_a_switch_that_cannot_repay_its_load_cost():
+    releases = [
+        Release('a', 'model-a', 'runtime-a'),
+        Release('b', 'model-b', 'runtime-b', estimated_load_seconds=20),
+    ]
+    plan = GlobalGepetto(
+        minimum_residency_seconds=0,
+        planning_horizon_seconds=10,
+        target_utilization=0.75,
+    ).plan([_gpu(0, 'a')], releases, [ReleaseDemand('b', 1)], now=100)
+
+    assert plan.assignments == {'gpu-0': 'a'}
+    assert plan.transitions == ()
+    assert plan.deferred == {'b': 'switching cost exceeds the planning-horizon benefit'}
+
+
+def test_minimum_replica_repair_bypasses_demand_hysteresis_and_switch_cost():
+    releases = [
+        Release('a', 'model-a', 'runtime-a'),
+        Release('b', 'model-b', 'runtime-b', minimum_replicas=1, estimated_load_seconds=10_000),
+    ]
+    plan = GlobalGepetto(
+        minimum_residency_seconds=0,
+        switch_sustain_seconds=10_000,
+        planning_horizon_seconds=1,
+        target_utilization=0.75,
+    ).plan([_gpu(0, 'a')], releases, [], now=100)
+
+    assert plan.assignments == {'gpu-0': 'b'}
+    assert len(plan.transitions) == 1
+
+
+def test_only_the_minimum_replica_gap_bypasses_switch_cost():
+    releases = [
+        Release('a', 'model-a', 'runtime-a'),
+        Release('b', 'model-b', 'runtime-b', minimum_replicas=1, estimated_load_seconds=10_000),
+    ]
+    plan = GlobalGepetto(
+        minimum_residency_seconds=0,
+        planning_horizon_seconds=1,
+        target_utilization=0.75,
+    ).plan([_gpu(index, 'a') for index in range(3)], releases, [ReleaseDemand('b', 10)], now=100)
+
+    assert len(plan.transitions) == 1
+    assert plan.replica_counts == {'a': 2, 'b': 1}
+    assert plan.deferred == {'b': 'switching cost exceeds the planning-horizon benefit'}

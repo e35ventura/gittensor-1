@@ -24,6 +24,7 @@ from gittensor.constants import COMPUTE_EMISSION_SHARE, MAX_COMPUTE_EMISSION_SHA
 class ComputeAllocation:
     scores: dict[int, float]
     emission_share: float
+    reserved_emission_share: float
 
 
 _MAX_SETTLEMENT_BYTES = 1024 * 1024
@@ -105,7 +106,7 @@ def _allocation_from_settlement(
     rewards = settlement.get('hotkey_rewards')
     metadata = settlement.get('metadata')
     if not isinstance(rewards, dict) or not isinstance(metadata, dict):
-        return ComputeAllocation({}, 0.0)
+        return ComputeAllocation({}, 0.0, 0.0)
     for hotkey, raw_amount in rewards.items():
         uid = uid_by_hotkey.get(hotkey)
         if uid is None:
@@ -118,19 +119,37 @@ def _allocation_from_settlement(
             numeric_amount = float(amount)
             if numeric_amount < float('inf'):
                 scores[uid] = scores.get(uid, 0.0) + numeric_amount
+    raw_emission_share = metadata.get('compute_emission_share')
+    emission_share_valid = raw_emission_share is not None
     try:
-        emission_share = float(metadata.get('compute_emission_share', 0.0))
+        emission_share = float(raw_emission_share) if raw_emission_share is not None else 0.0
     except (TypeError, ValueError):
-        emission_share = COMPUTE_EMISSION_SHARE
-    if not math.isfinite(emission_share) or emission_share <= 0:
-        emission_share = COMPUTE_EMISSION_SHARE
-    return ComputeAllocation(scores, min(MAX_COMPUTE_EMISSION_SHARE, emission_share))
+        emission_share = 0.0
+    if not math.isfinite(emission_share) or emission_share < 0:
+        emission_share_valid = False
+        emission_share = 0.0
+    raw_reserved_share = metadata.get('compute_reserved_emission_share')
+    try:
+        reserved_share = float(
+            raw_reserved_share
+            if raw_reserved_share is not None
+            else emission_share
+            if emission_share_valid
+            else COMPUTE_EMISSION_SHARE
+        )
+    except (TypeError, ValueError):
+        reserved_share = COMPUTE_EMISSION_SHARE
+    if not math.isfinite(reserved_share) or reserved_share < 0:
+        reserved_share = COMPUTE_EMISSION_SHARE
+    emission_share = min(MAX_COMPUTE_EMISSION_SHARE, emission_share)
+    reserved_share = min(MAX_COMPUTE_EMISSION_SHARE, max(emission_share, reserved_share))
+    return ComputeAllocation(scores, emission_share, reserved_share)
 
 
 def _recycled_compute_allocation(settlement: dict[str, object] | None = None) -> ComputeAllocation:
     """Reserve the last stated compute slice, or its baseline, for recycle."""
     if settlement is not None:
         allocation = _allocation_from_settlement((), settlement)
-        if allocation.emission_share > 0:
-            return ComputeAllocation({}, allocation.emission_share)
-    return ComputeAllocation({}, COMPUTE_EMISSION_SHARE)
+        if allocation.reserved_emission_share > 0:
+            return ComputeAllocation({}, 0.0, allocation.reserved_emission_share)
+    return ComputeAllocation({}, 0.0, COMPUTE_EMISSION_SHARE)

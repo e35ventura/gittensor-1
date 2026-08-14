@@ -85,6 +85,7 @@ async def forward(self: 'Validator') -> None:
             maintainer_uids_by_repo,
             compute_allocation.scores if compute_allocation is not None else None,
             compute_allocation.emission_share if compute_allocation is not None else None,
+            compute_allocation.reserved_emission_share if compute_allocation is not None else None,
         )
 
         # These are already normalized emission allocations. Applying the base

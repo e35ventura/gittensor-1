@@ -58,11 +58,23 @@ class SQLiteStateStore:
                     release_digest TEXT NOT NULL,
                     service_seconds REAL NOT NULL,
                     created_at REAL NOT NULL,
-                    expires_at REAL NOT NULL
+                    expires_at REAL NOT NULL,
+                    kv_bytes INTEGER NOT NULL DEFAULT 9223372036854775807,
+                    capacity_units REAL NOT NULL DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS reservations_expires_at ON reservations(expires_at);
                 """
             )
+            reservation_columns = {
+                str(row['name']) for row in connection.execute('PRAGMA table_info(reservations)').fetchall()
+            }
+            if 'kv_bytes' not in reservation_columns:
+                connection.execute(
+                    'ALTER TABLE reservations '
+                    'ADD COLUMN kv_bytes INTEGER NOT NULL DEFAULT 9223372036854775807'
+                )
+            if 'capacity_units' not in reservation_columns:
+                connection.execute('ALTER TABLE reservations ADD COLUMN capacity_units REAL NOT NULL DEFAULT 1')
         os.chmod(self.path, 0o600)
 
     def load_state(self) -> dict[str, Any] | None:
@@ -132,15 +144,27 @@ class SQLiteStateStore:
         service_seconds: float,
         created_at: float,
         expires_at: float,
+        kv_bytes: int,
+        capacity_units: float,
     ) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO reservations(
-                    reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at
-                ) VALUES(?, ?, ?, ?, ?, ?)
+                    reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at,
+                    kv_bytes, capacity_units
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at),
+                (
+                    reservation_id,
+                    gpu_id,
+                    release_digest,
+                    service_seconds,
+                    created_at,
+                    expires_at,
+                    kv_bytes,
+                    capacity_units,
+                ),
             )
 
     def complete_reservation(self, reservation_id: str) -> bool:
@@ -208,7 +232,8 @@ class SQLiteStateStore:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at
+                SELECT reservation_id, gpu_id, release_digest, service_seconds, created_at, expires_at,
+                       kv_bytes, capacity_units
                 FROM reservations
                 """
             ).fetchall()

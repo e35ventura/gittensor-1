@@ -14,6 +14,8 @@ class AutoscaleDecision:
     utilization: float
     concurrent_demand: float
     rejection_demand_ewma: float
+    required_target: int
+    supply_shortage: float
     changed: bool
     reason: str
 
@@ -21,21 +23,20 @@ class AutoscaleDecision:
 class FleetAutoscaler:
     """Adjust the desired target after sustained high or low utilization.
 
-    Rejections are converted to concurrent-equivalent demand using
-    ``rejected_requests_per_second * expected_service_seconds``. The target has
-    a floor and intentionally has no product-level maximum.
+    Accepted and rejected work arrive as time-weighted GPU equivalents. A
+    request consumes the larger of its concurrency share and KV-cache share,
+    so releases with different safe capacities remain comparable. The target
+    has a floor and intentionally has no product-level maximum.
     """
 
     def __init__(
         self,
         config: AutoscalingConfig,
         floor: int,
-        certified_slots_per_gpu: int,
         initial_target: int,
     ) -> None:
         self.config = config
         self.floor = floor
-        self.certified_slots_per_gpu = certified_slots_per_gpu
         self.desired_target = max(floor, initial_target)
         self.rejection_demand_ewma = 0.0
         self.high_since: float | None = None
@@ -45,22 +46,23 @@ class FleetAutoscaler:
     def update(
         self,
         *,
-        active_slots: float,
-        rejected_concurrent_demand: float,
+        active_gpu_equivalents: float,
+        rejected_gpu_equivalents: float,
         funded_target: int,
         now: float,
     ) -> AutoscaleDecision:
         alpha = self.config.ewma_alpha
-        self.rejection_demand_ewma = (
-            alpha * max(0.0, rejected_concurrent_demand) + (1.0 - alpha) * self.rejection_demand_ewma
-        )
-        demand = max(0.0, float(active_slots)) + self.rejection_demand_ewma
-        capacity = max(1, funded_target * self.certified_slots_per_gpu)
+        self.rejection_demand_ewma = alpha * max(0.0, rejected_gpu_equivalents) + (
+            1.0 - alpha
+        ) * self.rejection_demand_ewma
+        demand = max(0.0, float(active_gpu_equivalents)) + self.rejection_demand_ewma
+        capacity = max(1, funded_target)
         utilization = demand / capacity
-        desired_capacity = max(1, self.desired_target * self.certified_slots_per_gpu)
+        desired_capacity = max(1, self.desired_target)
         desired_utilization = demand / desired_capacity
-        threshold_capacity = self.certified_slots_per_gpu * self.config.utilization_up
-        required_target = max(self.floor, math.floor(demand / threshold_capacity) + 1) if demand > 0 else self.floor
+        required_capacity = demand / self.config.utilization_up if demand > 0 else 0.0
+        required_target = max(self.floor, math.floor(required_capacity) + 1) if demand > 0 else self.floor
+        supply_shortage = max(0.0, required_capacity - funded_target)
         changed = False
         reason = 'inside hysteresis band'
 
@@ -105,6 +107,8 @@ class FleetAutoscaler:
             utilization=utilization,
             concurrent_demand=demand,
             rejection_demand_ewma=self.rejection_demand_ewma,
+            required_target=required_target,
+            supply_shortage=supply_shortage,
             changed=changed,
             reason=reason,
         )

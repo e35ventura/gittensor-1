@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 import bittensor as bt
 import pytest
 
-from gittensor.compute.auth import HotkeyRequestSigner, ValidatorCommandAuthenticator
-from gittensor.compute.inference_tokens import issue_inference_capability
+from gittensor.compute.auth import AuthenticationError, HotkeyRequestSigner, ValidatorCommandAuthenticator
+from gittensor.compute.inference_tokens import InferenceCapability, issue_inference_capability
 from gittensor.compute.miner_agent import (
     InferenceCapacityUnavailable,
     MinerAgentConfig,
@@ -41,6 +41,16 @@ def _command(epoch=1):
         token_proof_scheme='sr25519-response-v1',
         certified_slots=4,
         assignment_token='assignment-secret',
+    )
+
+
+def _capability(command, *, reservation_id='reservation-1', reserved_kv_bytes=1_024):
+    return InferenceCapability(
+        reservation_id=reservation_id,
+        gpu_id=command.gpu_id,
+        release_digest=command.release_digest,
+        expires_at=time.time() + 30,
+        reserved_kv_bytes=reserved_kv_bytes,
     )
 
 
@@ -228,15 +238,84 @@ def test_miner_agent_enforces_signed_certified_concurrency(tmp_path):
         'request_id': 'request-1',
         'created': int(time.time()),
         'release_digest': command.release_digest,
-        'openai_request': {'model': command.model_id},
+        'openai_request': {'model': command.model_id, 'max_tokens': 1},
     }
     response = MagicMock()
 
     with patch('gittensor.compute.miner_agent.no_redirect_urlopen', return_value=response):
-        assert agent.open_inference(payload) is response
+        capability = _capability(command)
+        assert agent.open_inference(payload, capability) is response
         with pytest.raises(InferenceCapacityUnavailable, match='certified concurrency'):
-            agent.open_inference(payload)
-        agent.close_inference()
+            agent.open_inference(payload, _capability(command, reservation_id='reservation-2'))
+        agent.close_inference(capability.reserved_kv_bytes)
+
+
+def test_miner_agent_enforces_the_signed_aggregate_kv_budget(tmp_path):
+    validator = bt.Keypair.create_from_uri('//Alice')
+    store = SQLiteAgentStateStore(tmp_path / 'agent.sqlite3')
+    agent = MinerRuntimeAgent(
+        _config(tmp_path, validator.ss58_address),
+        MemoryRuntime(),
+        store,
+        ValidatorCommandAuthenticator(validator.ss58_address, store, 30),
+        RecordingAcknowledgements(),
+    )
+    command = AssignmentCommand(
+        **{
+            **asdict(_command()),
+            'max_context_tokens': 100,
+            'kv_cache_capacity_bytes': 100,
+        }
+    )
+    agent.accept_assignment(command)
+    _wait_for_state(agent, GPUState.RUNTIME_VERIFY)
+    payload = {
+        'request_id': 'request-1',
+        'created': int(time.time()),
+        'release_digest': command.release_digest,
+        'openai_request': {'model': command.model_id, 'max_tokens': 1},
+    }
+    first = _capability(command, reservation_id='reservation-1', reserved_kv_bytes=60)
+    second = _capability(command, reservation_id='reservation-2', reserved_kv_bytes=50)
+
+    with patch('gittensor.compute.miner_agent.no_redirect_urlopen', return_value=MagicMock()) as open_runtime:
+        agent.open_inference(payload, first)
+        with pytest.raises(InferenceCapacityUnavailable, match='KV-cache capacity'):
+            agent.open_inference(payload, second)
+        assert open_runtime.call_count == 1
+        assert agent.status()['active_kv_bytes'] == 60
+        agent.close_inference(first.reserved_kv_bytes)
+
+    assert agent.status()['active_kv_bytes'] == 0
+
+
+def test_miner_agent_rejects_a_request_larger_than_its_signed_kv_reservation(tmp_path):
+    validator = bt.Keypair.create_from_uri('//Alice')
+    store = SQLiteAgentStateStore(tmp_path / 'agent.sqlite3')
+    agent = MinerRuntimeAgent(
+        _config(tmp_path, validator.ss58_address),
+        MemoryRuntime(),
+        store,
+        ValidatorCommandAuthenticator(validator.ss58_address, store, 30),
+        RecordingAcknowledgements(),
+    )
+    command = _command()
+    agent.accept_assignment(command)
+    _wait_for_state(agent, GPUState.RUNTIME_VERIFY)
+
+    with pytest.raises(AuthenticationError, match='signed KV reservation'):
+        agent.open_inference(
+            {
+                'request_id': 'request-1',
+                'created': int(time.time()),
+                'release_digest': command.release_digest,
+                'openai_request': {'model': command.model_id, 'max_tokens': 1},
+            },
+            _capability(command, reserved_kv_bytes=2),
+        )
+
+    assert agent.status()['active_inference'] == 0
+    assert agent.status()['active_kv_bytes'] == 0
 
 
 def test_miner_agent_rejects_a_different_model_inside_a_valid_release_request(tmp_path):
@@ -260,7 +339,8 @@ def test_miner_agent_rejects_a_different_model_inside_a_valid_release_request(tm
                 'created': int(time.time()),
                 'release_digest': command.release_digest,
                 'openai_request': {'model': 'small-model'},
-            }
+            },
+            _capability(command),
         )
 
     assert agent.status()['active_inference'] == 0
@@ -295,11 +375,12 @@ def test_miner_agent_preserves_runtime_client_error_without_losing_concurrency_a
     )
 
     with patch('gittensor.compute.miner_agent.no_redirect_urlopen', side_effect=failure):
-        response = agent.open_inference(payload)
+        capability = _capability(command)
+        response = agent.open_inference(payload, capability)
         assert response.code == HTTPStatus.UNPROCESSABLE_ENTITY.value
         assert agent.status()['active_inference'] == 1
         response.close()
-        agent.close_inference()
+        agent.close_inference(capability.reserved_kv_bytes)
 
     assert agent.status()['active_inference'] == 0
 
