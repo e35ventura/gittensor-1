@@ -52,9 +52,9 @@ class FleetAutoscaler:
         now: float,
     ) -> AutoscaleDecision:
         alpha = self.config.ewma_alpha
-        self.rejection_demand_ewma = alpha * max(0.0, rejected_gpu_equivalents) + (
-            1.0 - alpha
-        ) * self.rejection_demand_ewma
+        self.rejection_demand_ewma = (
+            alpha * max(0.0, rejected_gpu_equivalents) + (1.0 - alpha) * self.rejection_demand_ewma
+        )
         demand = max(0.0, float(active_gpu_equivalents)) + self.rejection_demand_ewma
         capacity = max(1, funded_target)
         utilization = demand / capacity

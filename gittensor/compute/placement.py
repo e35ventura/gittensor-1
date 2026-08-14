@@ -63,9 +63,7 @@ class GlobalGepetto:
             return PlacementPlan({}, {}, ())
 
         release_by_digest = {release.release_digest: release for release in release_list}
-        demand_by_release = {
-            item.release_digest: max(0.0, item.gpu_equivalent_demand) for item in demand
-        }
+        demand_by_release = {item.release_digest: max(0.0, item.gpu_equivalent_demand) for item in demand}
         ready_counts = {
             release.release_digest: sum(
                 1
@@ -82,8 +80,7 @@ class GlobalGepetto:
             for release in release_list
         }
         shortages = {
-            digest: max(0.0, required - ready_counts.get(digest, 0))
-            for digest, required in required_capacity.items()
+            digest: max(0.0, required - ready_counts.get(digest, 0)) for digest, required in required_capacity.items()
         }
         self._update_shortage_timers(shortages, release_by_digest, ready_counts, now)
 
@@ -243,8 +240,7 @@ class GlobalGepetto:
             return quotas
 
         weights = {
-            release.release_digest: max(0.0, demand.get(release.release_digest, 0.0))
-            * release.placement_weight
+            release.release_digest: max(0.0, demand.get(release.release_digest, 0.0)) * release.placement_weight
             for release in releases
         }
         if sum(weights.values()) == 0:

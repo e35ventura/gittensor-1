@@ -65,12 +65,15 @@ class Release:
         }
         if any(not isinstance(value, int) or isinstance(value, bool) for value in integer_capacity.values()):
             raise ValueError('release capacity values must be integers')
-        if min(
-            self.max_concurrency,
-            self.max_context_tokens,
-            self.kv_bytes_per_token,
-            self.kv_cache_capacity_bytes,
-        ) < 1:
+        if (
+            min(
+                self.max_concurrency,
+                self.max_context_tokens,
+                self.kv_bytes_per_token,
+                self.kv_cache_capacity_bytes,
+            )
+            < 1
+        ):
             raise ValueError('release capacity values must be positive')
         if self.request_overhead_tokens < 0:
             raise ValueError('request_overhead_tokens cannot be negative')

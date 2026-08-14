@@ -70,8 +70,7 @@ class SQLiteStateStore:
             }
             if 'kv_bytes' not in reservation_columns:
                 connection.execute(
-                    'ALTER TABLE reservations '
-                    'ADD COLUMN kv_bytes INTEGER NOT NULL DEFAULT 9223372036854775807'
+                    'ALTER TABLE reservations ADD COLUMN kv_bytes INTEGER NOT NULL DEFAULT 9223372036854775807'
                 )
             if 'capacity_units' not in reservation_columns:
                 connection.execute('ALTER TABLE reservations ADD COLUMN capacity_units REAL NOT NULL DEFAULT 1')

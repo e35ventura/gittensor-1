@@ -80,7 +80,7 @@ def test_legacy_reservations_migrate_with_fail_closed_capacity(tmp_path):
     path = tmp_path / 'legacy.sqlite3'
     with sqlite3.connect(path) as connection:
         connection.execute(
-            '''
+            """
             CREATE TABLE reservations (
                 reservation_id TEXT PRIMARY KEY,
                 gpu_id TEXT NOT NULL,
@@ -89,7 +89,7 @@ def test_legacy_reservations_migrate_with_fail_closed_capacity(tmp_path):
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL
             )
-            '''
+            """
         )
         connection.execute(
             'INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?)',

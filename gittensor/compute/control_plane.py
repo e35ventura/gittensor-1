@@ -1373,10 +1373,10 @@ class ComputeControlPlane:
                 'registered_gpus': len(self.gpus),
                 'ready_gpus': sum(record.is_ready(timestamp) for record in self.gpus.values()),
                 'supply': {
-                    'gpu_equivalent_demand': self.last_autoscale.concurrent_demand
+                    'gpu_equivalent_demand': self.last_autoscale.concurrent_demand if self.last_autoscale else 0.0,
+                    'required_target': self.last_autoscale.required_target
                     if self.last_autoscale
-                    else 0.0,
-                    'required_target': self.last_autoscale.required_target if self.last_autoscale else self.config.fleet.floor,
+                    else self.config.fleet.floor,
                     'shortage_gpus': self.last_autoscale.supply_shortage if self.last_autoscale else 0.0,
                 },
                 'placements': dict(self.placement.assignments),
