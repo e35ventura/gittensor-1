@@ -130,6 +130,12 @@ def make_handler(
                             'filesystem_digest',
                             'runtime_commit',
                             'weight_files',
+                            'max_concurrency',
+                            'max_context_tokens',
+                            'kv_bytes_per_token',
+                            'kv_cache_capacity_bytes',
+                            'request_overhead_tokens',
+                            'estimated_load_seconds',
                         },
                         optional={'token_proof_scheme', 'minimum_replicas', 'placement_weight'},
                     )
@@ -196,7 +202,13 @@ def make_handler(
                 elif self.path == '/v1/route':
                     self._require_keys(
                         payload,
-                        required={'release_digest', 'requester_region', 'expected_service_seconds'},
+                        required={
+                            'release_digest',
+                            'requester_region',
+                            'expected_service_seconds',
+                            'estimated_input_tokens',
+                            'max_output_tokens',
+                        },
                         optional=set(),
                     )
                     self._send(HTTPStatus.CREATED, control_plane.route(**payload))

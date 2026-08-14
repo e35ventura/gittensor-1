@@ -7,7 +7,9 @@
     "target_price_currency": "USD",
     "subnet_miner_emission_value_per_hour": 26.0,
     "max_budget_per_hour": null,
-    "max_compute_emission_share": 0.5
+    "max_compute_emission_share": 0.5,
+    "scarcity_reward_exponent": 0.5,
+    "scarcity_multiplier_cap": 2.0
   },
   "emission_oracle": {
     "enabled": true,
@@ -68,7 +70,10 @@
   },
   "placement": {
     "minimum_residency_seconds": 900,
-    "control_interval_seconds": 60
+    "control_interval_seconds": 60,
+    "switch_sustain_seconds": 120,
+    "planning_horizon_seconds": 900,
+    "minimum_switch_gain_gpu": 0.1
   },
   "state": {
     "database_path": "var/gittensor-compute.sqlite3"

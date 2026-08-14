@@ -153,7 +153,8 @@ def test_end_to_end_verification_routing_scaling_funding_and_settlement():
     settlement, miner_rewards = control.settle(now=337)
     assert settlement.effective_ready_gpus == 4
     assert set(miner_rewards) == {0, 1, 2, 3}
-    assert sum(miner_rewards.values()) == settlement.window_budget
+    assert sum(miner_rewards.values()) == settlement.distributed_budget
+    assert settlement.distributed_budget < settlement.window_budget
 
 
 def test_completed_requests_still_count_toward_window_utilization():
@@ -186,8 +187,8 @@ def test_completed_requests_still_count_toward_window_utilization():
         assert control.complete_reservation(reservation.reservation_id, now=started + 10)
     second = control.tick(now=280)
 
-    assert first.autoscaling.concurrent_demand == pytest.approx(12)
-    assert second.autoscaling.concurrent_demand == pytest.approx(12)
+    assert first.autoscaling.concurrent_demand == pytest.approx(3)
+    assert second.autoscaling.concurrent_demand == pytest.approx(3)
     assert second.autoscaling.desired_target == 5
 
 
@@ -214,7 +215,138 @@ def test_expired_reservations_still_count_toward_window_utilization():
 
     tick = control.tick(now=131)
 
-    assert tick.autoscaling.concurrent_demand == pytest.approx(1.0)
+    assert tick.autoscaling.concurrent_demand == pytest.approx(0.25)
+
+
+def test_release_capacity_controls_concurrency_instead_of_the_gpu_registration_ceiling():
+    control = ComputeControlPlane(_config(), clock=Clock(100))
+    release = Release('release:serial', 'serial-model', 'runtime', max_concurrency=1)
+    control.register_release(release)
+    control.register_gpu(
+        GPURegistration(
+            gpu_id='gpu-1',
+            spark_node_id='node-1',
+            miner_uid=1,
+            endpoint='https://gpu-1',
+            region='us-east',
+            release_digest=release.release_digest,
+            canary_release_digest=release.release_digest,
+            certified_slots=4,
+        )
+    )
+    control.refresh_verification([_snapshot(1)], now=100)
+
+    control.route(release.release_digest, 'us-east', 10, now=100)
+
+    with pytest.raises(CapacityUnavailable):
+        control.route(release.release_digest, 'us-east', 10, now=101)
+
+
+def test_release_kv_budget_can_fill_before_its_concurrency_limit():
+    control = ComputeControlPlane(_config(), clock=Clock(100))
+    release = Release(
+        'release:kv',
+        'kv-model',
+        'runtime',
+        max_concurrency=4,
+        max_context_tokens=100,
+        kv_bytes_per_token=10,
+        kv_cache_capacity_bytes=1_000,
+    )
+    control.register_release(release)
+    control.register_gpu(
+        GPURegistration(
+            gpu_id='gpu-1',
+            spark_node_id='node-1',
+            miner_uid=1,
+            endpoint='https://gpu-1',
+            region='us-east',
+            release_digest=release.release_digest,
+            canary_release_digest=release.release_digest,
+            certified_slots=4,
+        )
+    )
+    control.refresh_verification([_snapshot(1)], now=100)
+
+    route = control.route(
+        release.release_digest,
+        'us-east',
+        10,
+        estimated_input_tokens=30,
+        max_output_tokens=30,
+        now=100,
+    )
+
+    assert route.reserved_kv_bytes == 600
+    with pytest.raises(CapacityUnavailable):
+        control.route(
+            release.release_digest,
+            'us-east',
+            10,
+            estimated_input_tokens=30,
+            max_output_tokens=30,
+            now=101,
+        )
+
+
+def test_mixed_releases_contribute_comparable_gpu_equivalent_demand():
+    control = ComputeControlPlane(_config(), clock=Clock(100))
+    releases = [
+        Release('release:four', 'model-four', 'runtime', max_concurrency=4),
+        Release('release:two', 'model-two', 'runtime', max_concurrency=2),
+    ]
+    for index, release in enumerate(releases):
+        control.register_release(release)
+        control.register_gpu(
+            GPURegistration(
+                gpu_id=f'gpu-{index}',
+                spark_node_id=f'node-{index}',
+                miner_uid=index,
+                endpoint=f'https://gpu-{index}',
+                region='us-east',
+                release_digest=release.release_digest,
+                canary_release_digest=release.release_digest,
+                certified_slots=4,
+            )
+        )
+    control.refresh_verification([_snapshot(0), _snapshot(1)], now=100)
+
+    control.route(releases[0].release_digest, 'us-east', 10, now=100)
+    control.route(releases[1].release_digest, 'us-east', 10, now=100)
+    tick = control.tick(now=110)
+
+    assert tick.autoscaling.concurrent_demand == pytest.approx(0.75)
+
+
+def test_supply_shortage_is_distinct_from_wrong_release_placement():
+    control = ComputeControlPlane(_config(), clock=Clock(100))
+    release_a = Release('release:a', 'model-a', 'runtime')
+    release_b = Release('release:b', 'model-b', 'runtime')
+    control.register_release(release_a)
+    control.register_release(release_b)
+    for index in range(4):
+        control.register_gpu(
+            GPURegistration(
+                gpu_id=f'gpu-{index}',
+                spark_node_id=f'node-{index}',
+                miner_uid=index,
+                endpoint=f'https://gpu-{index}',
+                region='us-east',
+                release_digest=release_a.release_digest,
+                canary_release_digest=release_a.release_digest,
+                certified_slots=4,
+            )
+        )
+    control.refresh_verification([_snapshot(index) for index in range(4)], now=100)
+
+    with pytest.raises(CapacityUnavailable):
+        control.route(release_b.release_digest, 'us-east', 10, now=100)
+    tick = control.tick(now=110)
+
+    assert tick.autoscaling.supply_shortage == 0
+    assert tick.autoscaling.required_target == 4
+    assert tick.placement.shortages[release_b.release_digest] > 0
+    assert release_b.release_digest in tick.placement.replica_counts
 
 
 def test_settlement_prorates_budget_when_funded_target_changes_mid_window():

@@ -88,3 +88,38 @@ def test_live_reservation_can_be_renewed_but_expired_one_cannot():
     assert router.active_counts(now=34) == {'gpu-0': 1}
     assert router.renew(reservation.reservation_id, now=35) is None
     assert router.active_counts(now=35) == {}
+
+
+def test_router_admits_by_both_release_concurrency_and_reserved_kv_cache():
+    router = FastestFinishRouter(reservation_ttl_seconds=60)
+    gpu = RoutingGPU(
+        gpu_id='gpu-0',
+        endpoint='https://gpu-0',
+        release_digest='release:1',
+        performance_class='rtx-5090',
+        certified_slots=4,
+        observed_active_slots=0,
+        remaining_work_seconds=0,
+        service_seconds=1,
+        rtt_ms=10,
+        kv_cache_capacity_bytes=1_000,
+    )
+
+    first = router.route(
+        [gpu],
+        'release:1',
+        now=0,
+        request_kv_bytes=600,
+        request_capacity_units=0.6,
+    )
+
+    assert first.reserved_kv_bytes == 600
+    assert first.capacity_units == pytest.approx(0.6)
+    with pytest.raises(CapacityUnavailable):
+        router.route(
+            [gpu],
+            'release:1',
+            now=1,
+            request_kv_bytes=600,
+            request_capacity_units=0.6,
+        )

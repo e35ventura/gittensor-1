@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from dataclasses import dataclass, replace
@@ -11,7 +12,7 @@ from gittensor.compute.storage import SQLiteStateStore
 
 
 class CapacityUnavailable(RuntimeError):
-    """Raised immediately when no compatible GPU has a free certified slot."""
+    """Raised immediately when no compatible GPU has certified request capacity."""
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class RoutingGPU:
     rtt_ms: float
     stream_public_key: str = ''
     eligible_until: float = float('inf')
+    kv_cache_capacity_bytes: int = 131_072
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,8 @@ class Reservation:
     service_seconds: float
     created_at: float
     expires_at: float
+    kv_bytes: int = 0
+    capacity_units: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,8 @@ class RouteDecision:
     expires_at: float
     stream_public_key: str = ''
     inference_token: str = ''
+    reserved_kv_bytes: int = 0
+    capacity_units: float = 0.0
 
 
 class FastestFinishRouter:
@@ -72,10 +78,18 @@ class FastestFinishRouter:
         candidates: Iterable[RoutingGPU],
         release_digest: str,
         now: float,
+        *,
+        request_kv_bytes: int = 1,
+        request_capacity_units: float = 0.25,
     ) -> RouteDecision:
+        if not isinstance(request_kv_bytes, int) or isinstance(request_kv_bytes, bool) or request_kv_bytes < 1:
+            raise ValueError('request_kv_bytes must be a positive integer')
+        if not math.isfinite(request_capacity_units) or not 0 < request_capacity_units <= 1:
+            raise ValueError('request_capacity_units must be in (0, 1]')
         with self._lock:
             self._expire(now)
             local = self._active_by_gpu()
+            local_kv = self._active_kv_by_gpu()
             ranked: list[tuple[RoutingGPU, int, float]] = []
             for gpu in candidates:
                 if gpu.release_digest != release_digest:
@@ -84,12 +98,14 @@ class FastestFinishRouter:
                 active = max(gpu.observed_active_slots, locally_active)
                 if active >= gpu.certified_slots:
                     continue
+                if local_kv.get(gpu.gpu_id, 0) + request_kv_bytes > gpu.kv_cache_capacity_bytes:
+                    continue
                 expected_completion = (
                     gpu.rtt_ms / 1000.0 + max(0.0, gpu.remaining_work_seconds) + max(0.0, gpu.service_seconds)
                 )
                 ranked.append((gpu, active, expected_completion))
             if not ranked:
-                raise CapacityUnavailable('no compatible READY GPU has a free certified slot')
+                raise CapacityUnavailable('no compatible READY GPU has free concurrency and KV capacity')
             fastest = min(item[2] for item in ranked)
             equivalent = [item for item in ranked if item[2] <= fastest + self.equivalent_finish_epsilon_seconds]
             # Completion time is the primary rule. Within a genuinely equivalent
@@ -111,6 +127,8 @@ class FastestFinishRouter:
                 service_seconds=selected.service_seconds,
                 created_at=now,
                 expires_at=expires_at,
+                kv_bytes=request_kv_bytes,
+                capacity_units=request_capacity_units,
             )
             self._reservations[reservation_id] = reservation
             if self._store is not None:
@@ -122,6 +140,8 @@ class FastestFinishRouter:
                         reservation.service_seconds,
                         reservation.created_at,
                         reservation.expires_at,
+                        reservation.kv_bytes,
+                        reservation.capacity_units,
                     )
                 except Exception:
                     self._reservations.pop(reservation_id, None)
@@ -133,6 +153,8 @@ class FastestFinishRouter:
                 expected_completion_seconds=expected_completion,
                 expires_at=expires_at,
                 stream_public_key=selected.stream_public_key,
+                reserved_kv_bytes=request_kv_bytes,
+                capacity_units=request_capacity_units,
             )
 
     def complete(self, reservation_id: str) -> bool:
@@ -203,13 +225,16 @@ class FastestFinishRouter:
             self._expire(now)
             return self._active_by_gpu()
 
-    def active_release_counts(self, now: float) -> dict[str, int]:
+    def active_capacity_by_release(self, now: float) -> dict[str, float]:
         with self._lock:
             self._expire(now)
-            counts: dict[str, int] = {}
+            totals: dict[str, float] = {}
             for reservation in self._reservations.values():
-                counts[reservation.release_digest] = counts.get(reservation.release_digest, 0) + 1
-            return counts
+                totals[reservation.release_digest] = totals.get(reservation.release_digest, 0.0) + max(
+                    0.0,
+                    reservation.capacity_units,
+                )
+            return totals
 
     def active_reservations(self, now: float) -> tuple[Reservation, ...]:
         with self._lock:
@@ -238,6 +263,11 @@ class FastestFinishRouter:
                     service_seconds=float(value['service_seconds']),
                     created_at=float(value['created_at']),
                     expires_at=float(value['expires_at']),
+                    # Old reservation records did not bind KV or fractional
+                    # capacity. Treat them as full/unknown until their short
+                    # TTL expires rather than risk overcommitting the GPU.
+                    kv_bytes=int(value.get('kv_bytes', 2**63 - 1)),
+                    capacity_units=float(value.get('capacity_units', 1.0)),
                 )
                 for value in reservations
                 if float(value['expires_at']) > now
@@ -266,3 +296,9 @@ class FastestFinishRouter:
         for reservation in self._reservations.values():
             counts[reservation.gpu_id] = counts.get(reservation.gpu_id, 0) + 1
         return counts
+
+    def _active_kv_by_gpu(self) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for reservation in self._reservations.values():
+            totals[reservation.gpu_id] = totals.get(reservation.gpu_id, 0) + reservation.kv_bytes
+        return totals

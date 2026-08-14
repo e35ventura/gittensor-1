@@ -11,11 +11,13 @@ def test_inference_capability_binds_route_and_rejects_tampering_and_expiry():
         gpu_id='gpu-1',
         release_digest='release:1',
         expires_at=now + 30,
+        reserved_kv_bytes=123,
     )
 
     capability = verify_inference_capability('assignment-secret', token, now=now)
     assert capability is not None
     assert capability.reservation_id == 'reservation-1'
+    assert capability.reserved_kv_bytes == 123
     assert verify_inference_capability('wrong-secret', token, now=now) is None
     assert verify_inference_capability('assignment-secret', f'{token}0', now=now) is None
     assert verify_inference_capability('assignment-secret', token, now=now + 30) is None

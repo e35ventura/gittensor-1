@@ -53,3 +53,28 @@ def test_cosign_failure_rejects_release():
     ):
         with pytest.raises(ValueError, match='signature verification failed'):
             CosignReleaseVerifier('cosign', '/keys/runtime.pub').verify(_release())
+
+
+def test_release_digest_binds_runtime_capacity_and_kv_budget():
+    release = _release()
+
+    changed_concurrency = replace(release, max_concurrency=release.max_concurrency + 1)
+    changed_kv = replace(
+        release,
+        kv_cache_capacity_bytes=release.kv_cache_capacity_bytes + release.max_context_tokens,
+    )
+
+    assert changed_concurrency.computed_release_digest() != release.release_digest
+    assert changed_kv.computed_release_digest() != release.release_digest
+
+
+def test_release_rejects_a_kv_budget_that_cannot_fit_one_max_context_request():
+    with pytest.raises(ValueError, match='fit at least one'):
+        Release(
+            'release',
+            'model',
+            'runtime',
+            max_context_tokens=1_000,
+            kv_bytes_per_token=10,
+            kv_cache_capacity_bytes=9_999,
+        )

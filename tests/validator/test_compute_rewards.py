@@ -7,7 +7,7 @@ import pytest
 from gittensor.compute.settlement_auth import SettlementSigner
 from gittensor.compute.storage import SQLiteStateStore
 from gittensor.constants import COMPUTE_EMISSION_SHARE, ISSUES_TREASURY_UID, RECYCLE_UID
-from gittensor.validator.compute_rewards import load_compute_allocation
+from gittensor.validator.compute_rewards import _allocation_from_settlement, load_compute_allocation
 from gittensor.validator.emission_allocation import blend_emission_pools
 
 
@@ -37,6 +37,7 @@ def test_finalized_hotkey_settlement_enters_validator_weights(tmp_path):
         miner_uids,
         compute_scores=allocation.scores,
         compute_emission_share=allocation.emission_share,
+        compute_reserved_emission_share=allocation.reserved_emission_share,
     )
 
     assert allocation.scores == {1: 2.5}
@@ -56,10 +57,12 @@ def test_missing_compute_settlement_recycles_compute_slice(tmp_path):
         {RECYCLE_UID},
         compute_scores=allocation.scores,
         compute_emission_share=allocation.emission_share,
+        compute_reserved_emission_share=allocation.reserved_emission_share,
     )
 
     assert allocation.scores == {}
-    assert allocation.emission_share == COMPUTE_EMISSION_SHARE
+    assert allocation.emission_share == 0.0
+    assert allocation.reserved_emission_share == COMPUTE_EMISSION_SHARE
     assert rewards[0] == pytest.approx(0.9)
 
 
@@ -86,10 +89,45 @@ def test_target_scaled_compute_share_enters_validator_weights(tmp_path):
         miner_uids,
         compute_scores=allocation.scores,
         compute_emission_share=allocation.emission_share,
+        compute_reserved_emission_share=allocation.reserved_emission_share,
     )
 
     assert allocation.emission_share == pytest.approx(0.15)
     assert rewards[sorted(miner_uids).index(1)] == pytest.approx(0.15)
+    assert rewards.sum() == pytest.approx(1.0)
+
+
+def test_unpaid_scarcity_budget_recycles_instead_of_expanding_oss_rewards(tmp_path):
+    path = tmp_path / 'compute.sqlite3'
+    store = SQLiteStateStore(path)
+    now = time.time()
+    store.finalize_settlement(
+        'window-1',
+        now - 100,
+        now,
+        {'miner-hotkey': '1.3'},
+        {
+            'compute_emission_share': 0.05,
+            'compute_reserved_emission_share': 0.10,
+        },
+        {},
+    )
+    hotkeys = ['recycle', 'miner-hotkey'] + ['unused'] * (ISSUES_TREASURY_UID - 2) + ['treasury']
+    allocation = load_compute_allocation(hotkeys, database_path=str(path), max_age_seconds=1_000)
+    assert allocation is not None
+    miner_uids = {RECYCLE_UID, 1, ISSUES_TREASURY_UID}
+
+    rewards = blend_emission_pools(
+        {},
+        {},
+        miner_uids,
+        compute_scores=allocation.scores,
+        compute_emission_share=allocation.emission_share,
+        compute_reserved_emission_share=allocation.reserved_emission_share,
+    )
+
+    assert rewards[sorted(miner_uids).index(1)] == pytest.approx(0.05)
+    assert rewards[sorted(miner_uids).index(RECYCLE_UID)] == pytest.approx(0.85)
     assert rewards.sum() == pytest.approx(1.0)
 
 
@@ -150,7 +188,23 @@ def test_non_finite_settlement_values_cannot_poison_validator_weights(tmp_path):
 
     assert allocation is not None
     assert allocation.scores == {}
-    assert allocation.emission_share == COMPUTE_EMISSION_SHARE
+    assert allocation.emission_share == 0.0
+    assert allocation.reserved_emission_share == COMPUTE_EMISSION_SHARE
+
+
+@pytest.mark.parametrize(
+    'settlement',
+    [
+        {'hotkey_rewards': [], 'metadata': {'compute_reserved_emission_share': 0.0}},
+        {'hotkey_rewards': {'miner-hotkey': '1'}, 'metadata': []},
+    ],
+)
+def test_malformed_fresh_settlement_recycles_the_baseline_compute_slice(settlement):
+    allocation = _allocation_from_settlement(['recycle', 'miner-hotkey'], settlement)
+
+    assert allocation.scores == {}
+    assert allocation.emission_share == 0.0
+    assert allocation.reserved_emission_share == COMPUTE_EMISSION_SHARE
 
 
 def test_compute_settlement_cannot_exceed_validator_emission_cap(tmp_path):
@@ -179,7 +233,8 @@ def test_invalid_remote_settlement_recycles_baseline_compute_slice(monkeypatch):
 
     assert allocation is not None
     assert allocation.scores == {}
-    assert allocation.emission_share == COMPUTE_EMISSION_SHARE
+    assert allocation.emission_share == 0.0
+    assert allocation.reserved_emission_share == COMPUTE_EMISSION_SHARE
 
 
 def test_future_dated_remote_settlement_is_recycled(monkeypatch):
@@ -215,4 +270,5 @@ def test_future_dated_remote_settlement_is_recycled(monkeypatch):
 
     assert allocation is not None
     assert allocation.scores == {}
-    assert allocation.emission_share == pytest.approx(0.15)
+    assert allocation.emission_share == 0.0
+    assert allocation.reserved_emission_share == pytest.approx(0.15)

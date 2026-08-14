@@ -6,10 +6,10 @@ One global pool of verified RTX 5090s serves every approved Gittensor model and 
 
 | Pillar | Required behavior |
 |---|---|
-| GPU market | Maintain a baseline GPU floor. Scale one desired target from total demand. Pay the target pool across verified READY time, so excess supply dilutes rewards. |
-| Global Gepetto | Produce and execute one `gpu_id -> release_digest` map across the entire verified fleet. |
+| GPU market | Maintain a baseline GPU floor. Scale one desired target from time-weighted GPU-equivalent demand. Use a sublinear scarcity premium below target and dilution above target. |
+| Global Gepetto | Produce and execute one `gpu_id -> release_digest` map across the entire verified fleet. Distinguish total supply shortage from wrong-release placement shortage. |
 | Verification | Verify unique RTX 5090 hardware, driver and uptime, pinned model/tokenizer revisions, signed runtime identity, local weights and response continuity. No-retention and host-resistant proof are a separate hardware tier. |
-| Router | Reserve the compatible READY GPU with the earliest predicted completion. Return 429 immediately when every certified slot is occupied. |
+| Router | Reserve the compatible READY GPU with the earliest predicted completion. Return 429 immediately when concurrency or KV capacity is full. |
 
 ## Request path
 
@@ -24,14 +24,15 @@ OpenAI request
   -> user
 ```
 
-The gateway never queues requests internally. It either reserves a certified slot or returns 429. Successful and rejected requests feed the same global demand measurement.
+The gateway never queues requests internally. It either creates an atomic, expiring reservation or returns 429. Successful and rejected requests feed the same global demand measurement.
 
 ## Dynamic target and emissions
 
 Configuration defines:
 
 - `F`: minimum GPU floor.
-- `K`: certified concurrency per GPU.
+- `C_r`: certified maximum concurrency for release `r`.
+- `M_r`: certified KV-cache byte budget for release `r`.
 - `T_req`: utilization-driven desired target.
 - `P`: target accounting price per verified GPU-hour.
 - `V`: current realized value of total subnet miner emissions per hour, in the same unit as `P`.
@@ -39,41 +40,64 @@ Configuration defines:
 - `S_max`: maximum compute share available from the subnet.
 
 ```text
-accepted demand = average concurrent reservation occupancy during the control window
-rejected demand = EWMA(429 rate × expected service time)
+request GPU fraction = max(1 / C_r, request KV bytes / M_r)
+accepted demand = average time-weighted GPU fractions during the control window
+rejected demand = EWMA(sum(429 request GPU fractions × expected service time) / window time)
 demand = max(live reservations, accepted demand) + rejected demand
-utilization = demand / (funded target × K)
+utilization = demand / funded target
+required target = max(F, floor(demand / utilization_up) + 1)
 target budget = T_req × P
 emission-value ceiling = V × S_max
 funded target = min(T_req, floor(min(B_cap, emission-value ceiling) / P))
 funded pool = min(T_req × P, B_cap, emission-value ceiling)
-compute emission share = funded pool / V
+paid compute share = distributed pool / V
+reserved compute share = funded pool / V
 ```
 
-- Sustained utilization at or above `utilization_up` raises `T_req` enough to return to that threshold.
+- Each approved release declares `C_r`, maximum context, KV bytes per token, `M_r`, request overhead and load cost. These values are part of its canonical release digest and signed Gepetto assignment. The fleet-level `certified_slots_per_gpu` is only an operator safety ceiling.
+- Sustained utilization at or above `utilization_up` raises `T_req` to `required target`, which leaves utilization strictly below the threshold after scaling.
 - Sustained utilization at or below `utilization_down` lowers `T_req` by one after cooldown, never below `F`.
 - Product scaling has no configured GPU maximum. The subnet emission cap is the economic ceiling and is surfaced as a funding shortfall.
 - A funding shortfall never makes `T_req` grow by itself. It rises only when measured demand requires more target GPUs.
 - The production oracle derives `V` from the latest finalized SN74 `IncentiveAlphaEmittedToMiners` event, exact event-block timestamps, the subnet alpha-to-TAO moving price at the finalized head and, for USD targets, the median of independent Coinbase and CoinGecko TAO/USD observations. It rejects missing, stale or divergent evidence and does not require an archive RPC.
 - Oracle freshness is part of funding. If refreshes fail for five minutes, the funding request falls back to `F × P`; scaled capacity is not funded from stale conversion data. If the subnet cap cannot fully fund `F`, the status exposes that funding shortfall instead of claiming the baseline is economically guaranteed. Manual emission-value changes are disabled while the automatic oracle is enabled.
-- `funded target` is a whole-GPU capacity count. Settlement uses the full fractional `funded pool`, so an emission ceiling worth 3.8 GPU-hours funds three target GPUs but pays the entire 3.8-GPU pool across verified READY time.
+- `funded target` is a whole-GPU routing count. Settlement retains the fractional `funded pool`, so an emission ceiling worth 3.8 GPU-hours reports three funded target GPUs and 3.8 effective funded GPUs for reward calculation.
 - The current implementation intentionally refuses multiple on-chain incentive mechanisms because the miner-emission event does not identify a mechanism. Add a mechanism-specific event or oracle before enabling that Bittensor feature.
 - `P` is an accounting target, not a guaranteed fiat payout. Realized miner income also depends on the accuracy of `V`, validator participation and Bittensor's final on-chain emission allocation.
 
-Example: `F=4`, `P=0.65`, `V=26.00/hour`. Each funded GPU requires 2.5% of current subnet miner emissions.
+Settlement applies a sublinear scarcity curve below the funded target:
 
-| READY supply | Funded target | Pool units/hour | Compute emissions | Relative payment/GPU |
+```text
+R = effective READY GPUs during the window
+E = effective funded GPUs represented by the funded pool
+scarcity multiplier = min(cap, (E / R) ^ beta) when 0 < R < E, otherwise 1
+distributed pool = min(funded pool, P × R × window hours × scarcity multiplier)
+```
+
+`beta` must be between zero and one. This pays each scarce GPU more than `P` while preserving a positive reward for every additional GPU. Any reserved compute share not distributed by the curve goes to recycle, not to open-source rewards.
+
+Example: `F=4`, `P=0.65`, `V=26.00/hour`, `beta=0.5`, scarcity cap `2.0`.
+
+| READY supply | Effective funded GPUs | Distributed/hour | Paid compute share | Payment/GPU |
 |---:|---:|---:|---:|---:|
-| 2 | 4 | 2.60 | 10% | 2× target |
-| 4 | 4 | 2.60 | 10% | target |
-| 8 | 4 | 2.60 | 10% | 0.5× target |
-| 6 after scale-up | 6 | 3.90 | 15% | target |
+| 1 | 4 | 1.30 | 5.00% | 1.300 |
+| 2 | 4 | 1.84 | 7.07% | 0.919 |
+| 4 | 4 | 2.60 | 10.00% | 0.650 |
+| 8 | 4 | 2.60 | 10.00% | 0.325 |
+| 6 after scale-up | 6 | 3.90 | 15.00% | 0.650 |
 
 Settlement uses verified READY-seconds, not registration, self-reported uptime or request count. Settlement and its next accounting checkpoint commit in one SQLite transaction.
 
 ## Global Gepetto
 
-Gepetto reads approved releases, verified hardware, live demand, minimum replicas and placement weights. It emits one global assignment map.
+Gepetto reads approved releases, verified hardware, per-release GPU-equivalent demand, minimum replicas and placement weights. It emits one global assignment map.
+
+The control plane reports two independent shortages:
+
+- Supply shortage: total demand exceeds the funded global GPU target.
+- Placement shortage: enough GPUs may exist globally, but too few currently run a requested release.
+
+Minimum replicas repair immediately. Other model switches require the placement shortage to remain above a configured gain band for `switch_sustain_seconds`. A switch is also deferred when drain time plus certified load time exceeds the capacity-seconds it can recover over `planning_horizon_seconds`. Shortage timers and deferred reasons persist across restart.
 
 Every transition is monotonic and durable:
 
@@ -102,7 +126,7 @@ The miner agent:
 | Ownership | A live SN74 hotkey signature resolves the UID from the metagraph. The SparkCompute enrollment map must bind the node to that same hotkey. |
 | Hardware | SparkCompute must verify RTX 5090 identity, GPU UUID, driver, timed GPU work, heartbeat and uptime. The trusted verifier also challenges unpredictable overlapping batches (three by default), so one physical GPU cannot satisfy several identities sequentially. Duplicate UUID claims are quarantined. |
 | Verifier | Strict mode requires the configured protocol, source commit and measured verifier build. Each verifier shard signs its exact complete status response with an offline-pinned public key. |
-| Release | The canonical digest includes exact model and tokenizer repositories and commits, runtime commit, container digest, filesystem digest, weight manifest and stream-proof scheme. |
+| Release | The canonical digest includes exact model and tokenizer repositories and commits, runtime commit, container digest, filesystem digest, weight manifest, stream-proof scheme, concurrency, context, KV budget, request overhead and load cost. |
 | Runtime | Cosign verifies the image digest before release admission. SparkCompute must report the exact running release and runtime measurements. This is host-resistant only when backed by a real TEE. |
 | Weights | Repeated unpredictable byte-range challenges are answered from the active local release and checked against the pinned Hugging Face commit. |
 | Response | Each OpenAI chunk is signed by a runtime key whose public key is bound into the verifier evidence. The gateway rejects missing, invalid or reordered proofs. This binding is host-resistant only in the confidential tier. |
@@ -183,7 +207,7 @@ NVIDIA's current [Trusted Computing supported-SKU list](https://docs.nvidia.com/
 
 ## Fastest-finish routing
 
-Only READY GPUs with a live verification lease, the exact release and a free certified slot are candidates.
+Only READY GPUs with a live verification lease, the exact release, free certified concurrency and enough unreserved KV bytes are candidates. Before routing, the gateway converts `max_completion_tokens` to one canonical `max_tokens` cap and inserts a 256-token cap when neither field is supplied. Requests that set both fields or request `n != 1` are rejected with HTTP 400 because their exact KV use cannot be reserved. The gateway and miner use the same deterministic byte-level upper bound for request context, and the miner independently repeats the normalization. Each reservation records its KV bytes and GPU fraction, and the one-use HMAC capability binds the KV amount. The miner rejects any request larger than its signed reservation.
 
 ```text
 predicted finish = measured gateway RTT
@@ -193,7 +217,7 @@ predicted finish = measured gateway RTT
 
 Completion time is primary. Inside a small equivalent-finish band, lower active concurrency wins. Equivalent GPUs in one location therefore receive one request each before requests stack on a single GPU.
 
-Reservations are small transactional rows, not full control-plane snapshots. Reservation expiry extends past the predicted request duration. Gateways cache independent HTTPS health-probe RTT by endpoint and separate it from full inference time; observations update per-region RTT and per-release performance calibration.
+Reservations are small transactional rows, not full control-plane snapshots. Creation is atomic and expiry extends past the predicted request duration. Old reservations without capacity fields migrate fail-closed until their short TTL expires. Gateways cache independent HTTPS health-probe RTT by endpoint and separate it from full inference time; observations update per-region RTT and per-release performance calibration.
 The miner independently enforces the assignment's signed concurrency limit. Every route receives a unique, expiring, one-use inference capability rather than the reusable assignment secret. Capabilities and reservations are capped by the verification lease. Any verification, weight or serving failure that quarantines a GPU rotates its assignment secret, deletes its reservations, removes its Gepetto placement and sends the miner a signed epoch revocation. Recovery requires a new Gepetto assignment and the full verification chain. The gateway renews reservations during long responses, and renewal fails if the GPU loses READY status or changes release.
 
 ## Processes and credentials
@@ -241,7 +265,7 @@ Co-located validators may read `GITTENSOR_COMPUTE_DB`. Remote validators use `GI
 1. Map settlement hotkeys onto the current metagraph.
 2. Read the target-scaled compute emission share from the atomic settlement.
 3. Normalize verified READY-time rewards inside that share.
-4. Recycle stale or empty compute allocation instead of paying unverifiable work.
+4. Recycle stale, malformed or empty compute allocation instead of paying unverifiable work or releasing the reserved compute slice.
 
 Deregistered or replaced hotkeys receive nothing because UID mapping happens at weight time.
 The validator installs each finalized allocation without an additional score EMA. This preserves the target-price compute percentage and prevents departed or quarantined GPUs from retaining historical payout weight.

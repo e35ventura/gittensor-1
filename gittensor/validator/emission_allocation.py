@@ -29,6 +29,7 @@ def blend_emission_pools(
     maintainer_uids_by_repo: Optional[Dict[str, list[int]]] = None,
     compute_scores: Optional[Dict[int, float]] = None,
     compute_emission_share: Optional[float] = None,
+    compute_reserved_emission_share: Optional[float] = None,
 ) -> np.ndarray:
     """Allocate the combined scoring pool by bounded repository emission_share.
 
@@ -55,9 +56,17 @@ def blend_emission_pools(
         if compute_enabled
         else 0.0
     )
-    oss_emission_share = OSS_EMISSION_SHARE - active_compute_share
+    reserved_compute_share = (
+        max(active_compute_share, min(MAX_COMPUTE_EMISSION_SHARE, compute_reserved_emission_share))
+        if compute_enabled
+        and compute_reserved_emission_share is not None
+        and math.isfinite(compute_reserved_emission_share)
+        else active_compute_share
+    )
+    oss_emission_share = OSS_EMISSION_SHARE - reserved_compute_share
     total_configured_share = sum(config.emission_share for config in master_repositories.values())
     recycle_share = max(0.0, 1.0 - total_configured_share) * oss_emission_share
+    recycle_share += max(0.0, reserved_compute_share - active_compute_share)
 
     for allocation in calculate_repo_emission_breakdown(
         miner_evaluations,

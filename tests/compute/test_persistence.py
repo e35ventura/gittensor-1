@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 
 from gittensor.compute.control_plane import ComputeControlPlane
@@ -73,6 +74,32 @@ def test_state_database_is_owner_only(tmp_path):
     SQLiteStateStore(path)
 
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_legacy_reservations_migrate_with_fail_closed_capacity(tmp_path):
+    path = tmp_path / 'legacy.sqlite3'
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE reservations (
+                reservation_id TEXT PRIMARY KEY,
+                gpu_id TEXT NOT NULL,
+                release_digest TEXT NOT NULL,
+                service_seconds REAL NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            'INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?)',
+            ('legacy', 'gpu-1', 'release:1', 10, 100, 200),
+        )
+
+    rows = SQLiteStateStore(path).load_reservations()
+
+    assert rows[0]['kv_bytes'] == 2**63 - 1
+    assert rows[0]['capacity_units'] == 1
 
 
 def test_restart_restores_registrations_leases_reservations_and_accounting(tmp_path):
@@ -252,7 +279,7 @@ def test_completion_and_utilization_checkpoint_commit_atomically(tmp_path):
     restored = ComputeControlPlane(_config(), clock=Clock(111), store=store)
 
     assert restored.router.reservation(reservation.reservation_id) is None
-    assert restored._completed_slot_seconds == {'release:1': 10}
+    assert restored._completed_capacity_seconds == {'release:1': 2.5}
 
 
 def test_completion_transaction_rollback_restores_reservation_and_demand(tmp_path):
@@ -283,10 +310,10 @@ def test_completion_transaction_rollback_restores_reservation_and_demand(tmp_pat
         raise AssertionError('simulated completion failure was accepted')
 
     assert control.router.reservation(reservation.reservation_id) is not None
-    assert control._completed_slot_seconds == {}
+    assert control._completed_capacity_seconds == {}
     restored = ComputeControlPlane(_config(), clock=Clock(111), store=SQLiteStateStore(store.path))
     assert restored.router.reservation(reservation.reservation_id) is not None
-    assert restored._completed_slot_seconds == {}
+    assert restored._completed_capacity_seconds == {}
 
 
 def test_late_completion_counts_occupancy_only_until_reservation_expiry(tmp_path):
@@ -314,7 +341,7 @@ def test_late_completion_counts_occupancy_only_until_reservation_expiry(tmp_path
 
     assert reservation.expires_at == 131
     assert control.complete_reservation(reservation.reservation_id, now=200)
-    assert control._completed_slot_seconds == {'release:1': 31}
+    assert control._completed_capacity_seconds == {'release:1': 7.75}
 
 
 def test_completion_after_status_expiry_consumes_demand_and_row_exactly_once(tmp_path):
@@ -342,11 +369,11 @@ def test_completion_after_status_expiry_consumes_demand_and_row_exactly_once(tmp
 
     control.status(now=131)
     assert control.complete_reservation(reservation.reservation_id, now=200)
-    assert control._completed_slot_seconds == {'release:1': 31}
+    assert control._completed_capacity_seconds == {'release:1': 7.75}
 
     restored = ComputeControlPlane(config, clock=Clock(200), store=store)
     assert restored.router.reservation(reservation.reservation_id) is None
-    assert restored._completed_slot_seconds == {'release:1': 31}
+    assert restored._completed_capacity_seconds == {'release:1': 7.75}
 
 
 def test_quarantine_after_status_expiry_consumes_demand_and_row_exactly_once(tmp_path):
@@ -377,7 +404,7 @@ def test_quarantine_after_status_expiry_consumes_demand_and_row_exactly_once(tmp
 
     restored = ComputeControlPlane(config, clock=Clock(132), store=store)
     assert restored.router.reservation(reservation.reservation_id) is None
-    assert restored._completed_slot_seconds == {'release:1': 31}
+    assert restored._completed_capacity_seconds == {'release:1': 7.75}
 
 
 def test_rejected_demand_survives_restart_before_control_tick(tmp_path):
@@ -391,7 +418,7 @@ def test_rejected_demand_survives_restart_before_control_tick(tmp_path):
         pass
 
     restored = ComputeControlPlane(_config(), clock=Clock(101), store=store)
-    assert restored._rejected_service_seconds == {'release:1': 10}
+    assert restored._rejected_capacity_seconds == {'release:1': 2.5}
 
 
 def test_expired_reservation_is_not_deleted_before_tick_checkpoints_its_demand(tmp_path):
@@ -423,7 +450,7 @@ def test_expired_reservation_is_not_deleted_before_tick_checkpoints_its_demand(t
 
     tick = restarted_before_tick.tick(now=131)
     restarted_after_tick = ComputeControlPlane(config, clock=Clock(131), store=store)
-    assert tick.autoscaling.concurrent_demand == 1
+    assert tick.autoscaling.concurrent_demand == 0.25
     assert restarted_after_tick.router.reservation(reservation.reservation_id) is None
 
 
@@ -459,14 +486,14 @@ def test_failed_tick_commit_restores_expired_reservation_and_demand_for_retry(tm
         raise AssertionError('simulated tick failure was accepted')
 
     assert control.router.reservation(reservation.reservation_id) is not None
-    assert control._completed_slot_seconds == {}
+    assert control._completed_capacity_seconds == {}
     assert control._last_tick_at == 100
     restored = ComputeControlPlane(config, clock=Clock(131), store=SQLiteStateStore(store.path))
     assert restored.router.reservation(reservation.reservation_id) is not None
 
     store.fail_tick = False
     tick = control.tick(now=131)
-    assert tick.autoscaling.concurrent_demand == 1
+    assert tick.autoscaling.concurrent_demand == 0.25
     assert control.router.reservation(reservation.reservation_id) is None
 
 
@@ -572,7 +599,8 @@ def test_settlement_and_accounting_checkpoint_are_committed_together(tmp_path):
     assert second.total_ready_seconds == 100
     latest = store.latest_settlement(1_000, now=300)
     assert latest is not None
-    assert latest['metadata']['compute_emission_share'] == 0.1
+    assert latest['metadata']['compute_emission_share'] == 0.05
+    assert latest['metadata']['compute_reserved_emission_share'] == 0.1
     settlements = store._connect().execute('SELECT COUNT(*) FROM settlements').fetchone()[0]
     assert settlements == 2
 

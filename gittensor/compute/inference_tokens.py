@@ -17,6 +17,7 @@ class InferenceCapability:
     gpu_id: str
     release_digest: str
     expires_at: float
+    reserved_kv_bytes: int
 
 
 def issue_inference_capability(
@@ -26,18 +27,22 @@ def issue_inference_capability(
     gpu_id: str,
     release_digest: str,
     expires_at: float,
+    reserved_kv_bytes: int = 1,
 ) -> str:
     if not secret or not reservation_id or not gpu_id or not release_digest:
         raise ValueError('inference capability fields cannot be empty')
     if not math.isfinite(expires_at) or expires_at <= 0:
         raise ValueError('inference capability expiry must be finite and positive')
+    if not isinstance(reserved_kv_bytes, int) or isinstance(reserved_kv_bytes, bool) or reserved_kv_bytes < 1:
+        raise ValueError('reserved_kv_bytes must be a positive integer')
     payload = json.dumps(
         {
-            'version': 1,
+            'version': 2,
             'reservation_id': reservation_id,
             'gpu_id': gpu_id,
             'release_digest': release_digest,
             'expires_at': expires_at,
+            'reserved_kv_bytes': reserved_kv_bytes,
         },
         sort_keys=True,
         separators=(',', ':'),
@@ -65,6 +70,7 @@ def verify_inference_capability(secret: str, token: str, *, now: float) -> Infer
             'gpu_id',
             'release_digest',
             'expires_at',
+            'reserved_kv_bytes',
         }:
             return None
         expires_at = float(payload['expires_at'])
@@ -73,15 +79,17 @@ def verify_inference_capability(secret: str, token: str, *, now: float) -> Infer
             gpu_id=str(payload['gpu_id']),
             release_digest=str(payload['release_digest']),
             expires_at=expires_at,
+            reserved_kv_bytes=int(payload['reserved_kv_bytes']),
         )
     except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
         return None
     if (
-        payload['version'] != 1
+        payload['version'] != 2
         or not capability.reservation_id
         or not capability.gpu_id
         or not capability.release_digest
         or not math.isfinite(capability.expires_at)
+        or capability.reserved_kv_bytes < 1
         or now >= capability.expires_at
     ):
         return None

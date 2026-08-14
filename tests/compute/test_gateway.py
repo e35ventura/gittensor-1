@@ -57,14 +57,22 @@ def test_gateway_converts_release_selector_to_the_canonical_runtime_model(monkey
         'release_digest': 'sha256:release',
         'model_id': 'owner/exact-model',
         'model_revision': 'a' * 40,
+        'request_overhead_tokens': 8,
+        'max_context_tokens': 4096,
     }
-    gateway._control_post = lambda path, payload: {
-        'reservation_id': 'reservation-1',
-        'gpu_id': 'gpu-1',
-        'endpoint': 'https://miner.example',
-        'expires_at': time.time() + 300,
-        'inference_token': 'capability',
-    }
+    control_request = {}
+
+    def route(path, payload):
+        control_request.update(payload)
+        return {
+            'reservation_id': 'reservation-1',
+            'gpu_id': 'gpu-1',
+            'endpoint': 'https://miner.example',
+            'expires_at': time.time() + 300,
+            'inference_token': 'capability',
+        }
+
+    gateway._control_post = route
     captured = {}
 
     def open_miner(url, *, body, headers, method, timeout):
@@ -78,6 +86,71 @@ def test_gateway_converts_release_selector_to_the_canonical_runtime_model(monkey
         session.close(success=None)
 
     assert captured['openai_request']['model'] == 'owner/exact-model'
+    assert captured['openai_request']['max_tokens'] == 256
+    assert 'max_completion_tokens' not in captured['openai_request']
+    assert control_request['estimated_input_tokens'] == len(b'{"messages":[]}') + 8
+    assert control_request['max_output_tokens'] == 256
+
+
+@pytest.mark.parametrize(
+    'request_fields, message',
+    [
+        ({'max_tokens': 1, 'max_completion_tokens': 2}, 'cannot both be set'),
+        ({'n': 2}, 'n must be 1'),
+    ],
+)
+def test_gateway_rejects_requests_it_cannot_reserve_exactly(monkeypatch, request_fields, message):
+    monkeypatch.setenv('CONTROL_TOKEN', 'control-token')
+    gateway = InferenceGateway(
+        GatewayConfig(
+            control_plane_url='https://control.example',
+            control_plane_token_env='CONTROL_TOKEN',
+            gateway_token_env='PUBLIC_TOKEN',
+            region='us-central',
+            require_stream_proof=False,
+        )
+    )
+    gateway._resolve_release = lambda model: {
+        'release_digest': 'sha256:release',
+        'model_id': 'owner/exact-model',
+        'model_revision': 'a' * 40,
+        'request_overhead_tokens': 8,
+        'max_context_tokens': 4096,
+    }
+
+    with pytest.raises(GatewayError, match=message) as exc_info:
+        gateway.open({'model': 'sha256:release', 'messages': [], **request_fields})
+
+    assert exc_info.value.status == 400
+
+
+def test_gateway_rejects_requests_above_the_release_context_before_routing(monkeypatch):
+    monkeypatch.setenv('CONTROL_TOKEN', 'control-token')
+    gateway = InferenceGateway(
+        GatewayConfig(
+            control_plane_url='https://control.example',
+            control_plane_token_env='CONTROL_TOKEN',
+            gateway_token_env='PUBLIC_TOKEN',
+            region='us-central',
+            require_stream_proof=False,
+        )
+    )
+    gateway._resolve_release = lambda model: {
+        'release_digest': 'sha256:release',
+        'model_id': 'owner/exact-model',
+        'model_revision': 'a' * 40,
+        'request_overhead_tokens': 8,
+        'max_context_tokens': 32,
+    }
+
+    with pytest.raises(GatewayError, match='context limit'):
+        gateway.open(
+            {
+                'model': 'sha256:release',
+                'messages': [{'role': 'user', 'content': 'this request is intentionally too long'}],
+                'max_tokens': 1,
+            }
+        )
 
 
 def _signed_chunk(signer, text, **extra):

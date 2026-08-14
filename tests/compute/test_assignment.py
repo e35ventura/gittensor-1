@@ -49,7 +49,16 @@ def test_global_gepetto_dispatches_and_enforces_assignment_lifecycle():
     clock = Clock(100)
     executor = RecordingExecutor()
     control = ComputeControlPlane(_config(), clock=clock, assignment_executor=executor)
-    release = Release('release:1', 'model', 'runtime')
+    release = Release(
+        'release:1',
+        'model',
+        'runtime',
+        max_concurrency=2,
+        max_context_tokens=1_000,
+        kv_bytes_per_token=10,
+        kv_cache_capacity_bytes=10_000,
+        request_overhead_tokens=7,
+    )
     control.register_release(release)
     control.register_miner_gpu(
         miner_uid=7,
@@ -66,6 +75,11 @@ def test_global_gepetto_dispatches_and_enforces_assignment_lifecycle():
     assert len(executor.commands) == 1
     assert executor.commands[0].release_digest == 'release:1'
     assert executor.commands[0].epoch == 1
+    assert executor.commands[0].certified_slots == 2
+    assert executor.commands[0].max_context_tokens == 1_000
+    assert executor.commands[0].kv_bytes_per_token == 10
+    assert executor.commands[0].kv_cache_capacity_bytes == 10_000
+    assert executor.commands[0].request_overhead_tokens == 7
     assert control.gpus['gpu-1'].state == GPUState.DRAINING
     control.acknowledge_assignment('gpu-1', 1, GPUState.LOADING, now=102)
     control.acknowledge_assignment(

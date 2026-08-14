@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -43,12 +44,43 @@ class Release:
     token_proof_scheme: str = 'sr25519-response-v1'
     minimum_replicas: int = 0
     placement_weight: float = 1.0
+    max_concurrency: int = 4
+    max_context_tokens: int = 131_072
+    kv_bytes_per_token: int = 1
+    kv_cache_capacity_bytes: int = 131_072
+    request_overhead_tokens: int = 0
+    estimated_load_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.release_digest or not self.model_id or not self.runtime_digest:
             raise ValueError('release digest, model id, and runtime digest are required')
         if self.minimum_replicas < 0 or self.placement_weight <= 0:
             raise ValueError('release placement values are invalid')
+        integer_capacity = {
+            'max_concurrency': self.max_concurrency,
+            'max_context_tokens': self.max_context_tokens,
+            'kv_bytes_per_token': self.kv_bytes_per_token,
+            'kv_cache_capacity_bytes': self.kv_cache_capacity_bytes,
+            'request_overhead_tokens': self.request_overhead_tokens,
+        }
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in integer_capacity.values()):
+            raise ValueError('release capacity values must be integers')
+        if (
+            min(
+                self.max_concurrency,
+                self.max_context_tokens,
+                self.kv_bytes_per_token,
+                self.kv_cache_capacity_bytes,
+            )
+            < 1
+        ):
+            raise ValueError('release capacity values must be positive')
+        if self.request_overhead_tokens < 0:
+            raise ValueError('request_overhead_tokens cannot be negative')
+        if self.kv_cache_capacity_bytes < self.max_context_tokens * self.kv_bytes_per_token:
+            raise ValueError('KV cache must fit at least one maximum-context request')
+        if not math.isfinite(self.estimated_load_seconds) or self.estimated_load_seconds < 0:
+            raise ValueError('estimated_load_seconds must be finite and non-negative')
         if self.model_revision and not _COMMIT_PATTERN.fullmatch(self.model_revision):
             raise ValueError('model_revision must be an immutable 40-character commit')
         if self.tokenizer_revision and not _COMMIT_PATTERN.fullmatch(self.tokenizer_revision):
@@ -108,6 +140,12 @@ class Release:
             'runtime_commit': self.runtime_commit,
             'weight_files': dict(sorted(self.weight_files.items())),
             'token_proof_scheme': self.token_proof_scheme,
+            'max_concurrency': self.max_concurrency,
+            'max_context_tokens': self.max_context_tokens,
+            'kv_bytes_per_token': self.kv_bytes_per_token,
+            'kv_cache_capacity_bytes': self.kv_cache_capacity_bytes,
+            'request_overhead_tokens': self.request_overhead_tokens,
+            'estimated_load_seconds': self.estimated_load_seconds,
         }
         encoded = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
         return f'sha256:{hashlib.sha256(encoded).hexdigest()}'
@@ -233,12 +271,28 @@ class AssignmentCommand:
     token_proof_scheme: str
     certified_slots: int
     assignment_token: str
+    max_context_tokens: int = 131_072
+    kv_cache_capacity_bytes: int = 131_072
+    kv_bytes_per_token: int = 1
+    request_overhead_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.certified_slots, int) or isinstance(self.certified_slots, bool):
             raise ValueError('certified_slots must be an integer')
         if self.certified_slots < 1:
             raise ValueError('certified_slots must be positive')
+        for field_name in ('max_context_tokens', 'kv_cache_capacity_bytes', 'kv_bytes_per_token'):
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f'{field_name} must be a positive integer')
+        if (
+            not isinstance(self.request_overhead_tokens, int)
+            or isinstance(self.request_overhead_tokens, bool)
+            or self.request_overhead_tokens < 0
+        ):
+            raise ValueError('request_overhead_tokens must be a non-negative integer')
+        if self.kv_cache_capacity_bytes < self.max_context_tokens * self.kv_bytes_per_token:
+            raise ValueError('assignment KV cache must fit one maximum-context request')
 
 
 @dataclass(frozen=True)
